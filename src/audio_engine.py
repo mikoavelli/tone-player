@@ -11,6 +11,8 @@ from error import AudioError
 from models import PlaybackProgress, PlayerState, ToneConfig
 
 _CHANNELS = 1
+_FALLBACK_CHANNELS = 2
+DEFAULT_DEVICE_LABEL = "Устройство вывода по умолчанию"
 
 # Буфер вывода PortAudio: (кадры, каналы), float32.
 AudioBuffer = np.ndarray[tuple[int, int], np.dtype[np.float32]]
@@ -31,6 +33,23 @@ class AudioStream(Protocol):
 
 
 StreamFactory = Callable[..., AudioStream]
+
+
+def list_output_devices() -> list[tuple[int, str]]:
+    """Список устройств вывода PortAudio: индекс и название."""
+    devices: list[tuple[int, str]] = []
+    try:
+        entries = sd.query_devices()
+    except Exception:  # noqa: BLE001 - список устройств только для выбора в окне
+        return devices
+
+    for index, entry in enumerate(entries):
+        channels: object = entry.get("max_output_channels")
+        if not isinstance(channels, int) or channels <= 0:
+            continue
+        name = entry.get("name")
+        devices.append((index, str(name) if name else f"Устройство {index}"))
+    return devices
 
 
 class ToneGenerator:
@@ -146,6 +165,8 @@ class TonePlayer:
         self._stream_factory = stream_factory
         self._generator = ToneGenerator(config)
         self._state = PlayerState.IDLE
+        self._device: int | str | None = config.device
+        self._channels = _CHANNELS
         self._stream: AudioStream | None = None
         self._last_status = ""
 
@@ -196,6 +217,17 @@ class TonePlayer:
         return self._resolve_device_name()
 
     @property
+    def device(self) -> int | str | None:
+        """Устройство вывода: индекс или часть названия; None — по умолчанию."""
+        return self._device
+
+    def set_device(self, device: int | str | None) -> None:
+        """Выбрать устройство вывода для следующего запуска."""
+        if self._state in (PlayerState.PLAYING, PlayerState.PAUSED):
+            raise AudioError("Устройство вывода нельзя сменить во время воспроизведения.")
+        self._device = device
+
+    @property
     def last_status(self) -> str:
         """Последнее сообщение потока PortAudio, если оно было."""
         return self._last_status
@@ -210,16 +242,8 @@ class TonePlayer:
         self._generator.reset()
         self._last_status = ""
 
-        try:
-            stream = self._stream_factory(
-                samplerate=self._config.sample_rate,
-                channels=_CHANNELS,
-                device=self._config.device,
-                dtype="float32",
-                callback=self._callback,
-            )
-        except Exception as err:
-            raise AudioError(f"Не удалось открыть устройство вывода: {err}") from err
+        stream, channels = self._open_stream()
+        self._channels = channels
 
         self._stream = stream
         self._state = PlayerState.PLAYING
@@ -298,13 +322,48 @@ class TonePlayer:
         Вызывается из потока PortAudio; в тестах метод используется напрямую.
         """
         count = outdata.shape[0] if frames < 0 else min(frames, outdata.shape[0])
+        channels = outdata.shape[1]
         if self._state is not PlayerState.PLAYING:
             outdata[:count] = 0.0
             return
 
-        outdata[:count, 0] = self._generator.render(count)
+        block = self._generator.render(count)
+        outdata[:count, 0] = block
+        for channel in range(1, channels):
+            outdata[:count, channel] = block
         if self._generator.finished:
             self._state = PlayerState.FINISHED
+
+    def _open_stream(self) -> tuple[AudioStream, int]:
+        """Открыть поток вывода, подбирая число каналов и устройство по умолчанию."""
+        attempts: list[tuple[int | str | None, int]] = [
+            (self._device, _CHANNELS),
+            (self._device, _FALLBACK_CHANNELS),
+        ]
+        if self._device is not None:
+            attempts.append((None, _CHANNELS))
+            attempts.append((None, _FALLBACK_CHANNELS))
+
+        errors: list[str] = []
+        for index, (device, channels) in enumerate(attempts):
+            try:
+                stream = self._stream_factory(
+                    samplerate=self._config.sample_rate,
+                    channels=channels,
+                    device=device,
+                    dtype="float32",
+                    callback=self._callback,
+                )
+            except Exception as err:  # noqa: BLE001 - перебираем варианты открытия
+                errors.append(f"устройство {device}, каналов {channels}: {err}")
+                continue
+
+            if index == 0:
+                return stream, channels
+            self._last_status = "Открыт запасной вариант вывода — " + errors[-1]
+            return stream, channels
+
+        raise AudioError("Не удалось открыть устройство вывода: " + "; ".join(errors))
 
     def _close_stream(self) -> None:
         stream = self._stream
@@ -319,8 +378,8 @@ class TonePlayer:
 
     def _resolve_device_name(self) -> str:
         try:
-            info = sd.query_devices(self._config.device, "output")
+            info = sd.query_devices(self._device, "output")
         except Exception:  # noqa: BLE001 - имя устройства только для информации
-            return "Устройство вывода"
+            return DEFAULT_DEVICE_LABEL
         name: object = info.get("name")
-        return str(name) if name else "Устройство вывода"
+        return str(name) if name else DEFAULT_DEVICE_LABEL

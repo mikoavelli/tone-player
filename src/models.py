@@ -23,7 +23,7 @@ class ToneConfig:
     target_spl_db: float
     sample_rate: int
     fade_ms: float
-    device: int | None
+    device: int | str | None
     default_offset_db: float
 
     @property

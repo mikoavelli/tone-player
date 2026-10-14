@@ -3,10 +3,11 @@
 import math
 from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -18,7 +19,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from audio_engine import TonePlayer
+from audio_engine import DEFAULT_DEVICE_LABEL, TonePlayer, list_output_devices
 from error import AudioError
 from models import PlayerState, ToneConfig
 
@@ -80,6 +81,20 @@ QSlider::handle:horizontal {
     margin: -6px 0;
     border-radius: 8px;
 }
+QComboBox {
+    background-color: #31363d;
+    border: 1px solid #454b54;
+    border-radius: 6px;
+    padding: 6px 10px;
+}
+QComboBox:disabled {
+    color: #61686f;
+}
+QComboBox QAbstractItemView {
+    background-color: #262a30;
+    border: 1px solid #454b54;
+    selection-background-color: #3c424a;
+}
 """
 
 
@@ -110,7 +125,7 @@ class MainWindow(QMainWindow):
         self._finishing_handled = False
 
         self.setWindowTitle("TonePlayer")
-        self.resize(560, 460)
+        self.resize(560, 520)
         self.setStyleSheet(_STYLESHEET)
 
         self._build_ui()
@@ -192,8 +207,28 @@ class MainWindow(QMainWindow):
         self.level_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.level_label)
 
-        self.device_label = QLabel(f"Устройство вывода: {self._player.device_name}")
-        self.device_label.setToolTip(self._base_directory.name)
+        self.device_selector = QComboBox()
+        self.device_selector.addItem(DEFAULT_DEVICE_LABEL, None)
+        for index, name in list_output_devices():
+            self.device_selector.addItem(f"{index}: {name}", index)
+        configured = self._config.device
+        if configured is not None:
+            position = self.device_selector.findData(configured)
+            if position >= 0:
+                self.device_selector.setCurrentIndex(position)
+        self._player.set_device(configured)
+        connect_index(self.device_selector.currentIndexChanged, self._on_device_changed)
+        device_row = QHBoxLayout()
+        device_row.addWidget(QLabel("Устройство вывода:"))
+        device_row.addWidget(self.device_selector, 1)
+        layout.addLayout(device_row)
+
+        self.status_label = QLabel()
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.status_label)
+
+        self.device_label = QLabel(f"Каталог приложения: {self._base_directory.name}")
+        self.device_label.setToolTip(str(self._base_directory))
         layout.addWidget(self.device_label)
 
     # -------------------------------------------------------------------------
@@ -223,6 +258,14 @@ class MainWindow(QMainWindow):
 
     def _on_level_changed(self, value: int) -> None:
         self._player.set_offset_db(float(value))
+        self._refresh()
+
+    def _on_device_changed(self, index: int) -> None:
+        device = cast("object", self.device_selector.itemData(index))
+        try:
+            self._player.set_device(device if isinstance(device, int) else None)
+        except AudioError:
+            return
         self._refresh()
 
     # -------------------------------------------------------------------------
@@ -255,7 +298,10 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(state in (PlayerState.IDLE, PlayerState.FINISHED))
         self.pause_button.setEnabled(state in (PlayerState.PLAYING, PlayerState.PAUSED))
         self.stop_button.setEnabled(state in (PlayerState.PLAYING, PlayerState.PAUSED))
+        self.device_selector.setEnabled(state not in (PlayerState.PLAYING, PlayerState.PAUSED))
         self.pause_button.setText("Продолжить" if state is PlayerState.PAUSED else "Пауза")
+
+        self.status_label.setText(self._player.last_status)
 
         offset_db = self._player.offset_db
         gain_db = self._config.gain_at(progress.tone_index)

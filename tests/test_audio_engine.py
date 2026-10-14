@@ -277,6 +277,73 @@ class TestTonePlayer(unittest.TestCase):
         _ = fill(player, int(RATE * 0.05))
         self.assertEqual(player.current_frequency, 1000.0)
 
+    def test_falls_back_to_stereo_on_mono_error(self) -> None:
+        attempts: list[dict[str, object]] = []
+
+        def factory(**kwargs: object) -> FakeStream:
+            attempts.append(kwargs)
+            if kwargs.get("channels") == 1:
+                raise OSError("нет моно")
+            return FakeStream(**kwargs)
+
+        player = TonePlayer(make_config(), stream_factory=factory)
+        _ = player.start()
+
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0]["channels"], 1)
+        self.assertEqual(attempts[1]["channels"], 2)
+
+    def test_falls_back_to_default_device(self) -> None:
+        attempts: list[dict[str, object]] = []
+
+        def factory(**kwargs: object) -> FakeStream:
+            attempts.append(kwargs)
+            if kwargs.get("device") is not None:
+                raise OSError("устройство недоступно")
+            return FakeStream(**kwargs)
+
+        config = ToneConfig(
+            frequencies=(500.0, 1000.0),
+            gain_db=(-12.0, -12.0),
+            seconds_per_tone=1.0,
+            target_spl_db=90.0,
+            sample_rate=RATE,
+            fade_ms=20.0,
+            device=3,
+            default_offset_db=0.0,
+        )
+        player = TonePlayer(config, stream_factory=factory)
+        _ = player.start()
+
+        self.assertIn("запасной вариант", player.last_status)
+        self.assertEqual(attempts[-1]["device"], None)
+
+    def test_stereo_buffer_gets_signal_in_both_channels(self) -> None:
+        player = self._player()
+        _ = player.start()
+        buffer = np.zeros((512, 2), dtype=np.float32)
+
+        player.fill_buffer(buffer)
+
+        left = buffer[:, 0]
+        right = buffer[:, 1]
+        self.assertGreater(peak(left), 0.0)
+        self.assertEqual(float((left - right).max()), 0.0)
+
+    def test_device_change_blocked_during_playback(self) -> None:
+        player = self._player()
+        _ = player.start()
+
+        with self.assertRaises(AudioError):
+            player.set_device(1)
+
+    def test_device_change_allowed_when_idle(self) -> None:
+        player = self._player()
+
+        player.set_device(1)
+
+        self.assertEqual(player.device, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

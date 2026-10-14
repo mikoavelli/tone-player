@@ -85,7 +85,7 @@ def load_config(config_path: Path) -> ToneConfig:
     if fade_ms <= 0.0:
         raise ConfigValidationError("Параметр 'fade_ms' должен быть больше нуля.")
 
-    device = _optional_int(output.get("device"), "output.device")
+    device = _optional_device(output.get("device"), "output.device")
     default_offset_db = _require_float(output.get("default_offset_db"), "output.default_offset_db")
 
     return ToneConfig(
@@ -123,10 +123,18 @@ def _require_int(value: object, name: str) -> int:
     return value
 
 
-def _optional_int(value: object, name: str) -> int | None:
+def _optional_device(value: object, name: str) -> int | str | None:
+    """Устройство вывода: индекс, часть названия или устройство по умолчанию."""
     if value is None:
         return None
-    return _require_int(value, name)
+    if isinstance(value, bool):
+        raise ConfigValidationError(f"Параметр '{name}' должен быть числом или строкой.")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        return None if text.lower() in ("", "default") else text
+    raise ConfigValidationError(f"Параметр '{name}' должен быть числом или строкой.")
 
 
 def _require_float_list(value: object, name: str) -> tuple[float, ...]:
