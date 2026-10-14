@@ -1,10 +1,15 @@
-"""Потоковый генератор контрольных тонов."""
+"""Потоковый генератор контрольных тонов.
+
+Звук формируется без numpy: синус берётся из таблицы, буфер вывода
+заполняется через RawOutputStream, поэтому в сборку не попадают ни numpy,
+ни связанные с ним библиотеки OpenBLAS.
+"""
 
 import math
+from array import array
 from collections.abc import Callable
-from typing import Protocol
+from typing import Protocol, cast
 
-import numpy as np
 import sounddevice as sd
 
 from error import AudioError
@@ -14,12 +19,24 @@ _CHANNELS = 1
 _FALLBACK_CHANNELS = 2
 DEFAULT_DEVICE_LABEL = "Устройство вывода по умолчанию"
 
-# Буфер вывода PortAudio: (кадры, каналы), float32.
-AudioBuffer = np.ndarray[tuple[int, int], np.dtype[np.float32]]
-# Блок сигнала: (кадры,), float64.
-ToneBlock = np.ndarray[tuple[int], np.dtype[np.float64]]
-# Готовый блок звука: (кадры,), float32.
-AudioBlock = np.ndarray[tuple[int], np.dtype[np.float32]]
+# Размер таблицы синуса — степень двойки, переход фазы выполняется по маске.
+TABLE_SIZE = 8192
+TABLE_MASK = TABLE_SIZE - 1
+_SINE_TABLE = array("f", (math.sin(2.0 * math.pi * i / TABLE_SIZE) for i in range(TABLE_SIZE)))
+_PI = math.pi
+_FRAME_SIZE = 4  # float32
+
+
+# Блок звука: (кадры,), float32.
+AudioBlock = array[float]
+
+
+class MutableBuffer(Protocol):
+    """Буфер вывода, в который можно записать байты (cffi-буфер, bytearray)."""
+
+    def __len__(self) -> int: ...
+
+    def __setitem__(self, key: slice, value: bytes) -> None: ...
 
 
 class AudioStream(Protocol):
@@ -92,6 +109,12 @@ class ToneGenerator:
         """Амплитуда текущего тона, 0.0..1.0."""
         return min(math.pow(10.0, self.current_gain_db / 20.0), 1.0)
 
+    @property
+    def fade_frames(self) -> int:
+        """Длительность нарастания и затухания в кадрах."""
+        fade = int(round(self._config.fade_seconds * self._config.sample_rate))
+        return max(min(fade, self.tone_length_frames // 2), 1)
+
     # -------------------------------------------------------------------------
     # Управление
     # -------------------------------------------------------------------------
@@ -109,41 +132,48 @@ class ToneGenerator:
 
     def render(self, frames: int) -> AudioBlock:
         """Сформировать кадры сигнала и сдвинуть позицию воспроизведения."""
-        buffer = np.zeros(frames, dtype=np.float32)
+        block = array("f", bytes(_FRAME_SIZE * frames))
         written = 0
         while written < frames and not self.finished:
             if self.frames_in_tone >= self.tone_length_frames:
                 self._advance()
                 continue
             count = min(frames - written, self.tone_length_frames - self.frames_in_tone)
-            buffer[written : written + count] = self._render_tone(count)
+            self._render_tone(block, written, count)
             written += count
             self.frames_in_tone += count
+
         if not self.finished and self.frames_in_tone >= self.tone_length_frames:
             self._advance()
-        return buffer
+        return block
 
     # -------------------------------------------------------------------------
     # Внутреннее
     # -------------------------------------------------------------------------
 
-    def _render_tone(self, count: int) -> ToneBlock:
-        rate = float(self._config.sample_rate)
-        frequency = self._config.frequency_at(self.index)
-        offset = np.arange(count, dtype=np.float64)
-        phase_step = 2.0 * np.pi * frequency / rate
-        time = (offset + self.frames_in_tone) / rate
-        samples = np.sin(self._phase + phase_step * offset)
-        self._phase = float((self._phase + phase_step * count) % (2.0 * np.pi))
-        return samples * self._envelope(time) * self.amplitude
+    def _render_tone(self, block: AudioBlock, start: int, count: int) -> None:
+        """Записать count кадров текущего тона начиная с позиции start."""
+        rate = self._config.sample_rate
+        step = TABLE_SIZE * self._config.frequency_at(self.index) / rate
+        amplitude = self.amplitude
+        fade = self.fade_frames
+        total = self.tone_length_frames
+        first = self.frames_in_tone
+        phase = self._phase
+        table = _SINE_TABLE
 
-    def _envelope(self, time: ToneBlock) -> ToneBlock:
-        """Плавное нарастание и затухание тона на его границах."""
-        fade = self._config.fade_seconds
-        total = self._config.seconds_per_tone
-        rise = np.clip(time / fade, 0.0, 1.0)
-        fall = np.clip((total - time) / fade, 0.0, 1.0)
-        return 0.5 * (1.0 - np.cos(np.pi * rise)) * 0.5 * (1.0 - np.cos(np.pi * fall))
+        for offset in range(count):
+            position = first + offset
+            if position < fade:
+                gain = amplitude * 0.5 * (1.0 - math.cos(_PI * position / fade))
+            elif position > total - fade:
+                gain = amplitude * 0.5 * (1.0 - math.cos(_PI * (total - position) / fade))
+            else:
+                gain = amplitude
+            block[start + offset] = table[int(phase) & TABLE_MASK] * gain
+            phase += step
+
+        self._phase = phase % TABLE_SIZE
 
     def _advance(self) -> None:
         self.index += 1
@@ -160,7 +190,11 @@ class TonePlayer:
     не сдвигает таймер и не зависит от точности системных часов.
     """
 
-    def __init__(self, config: ToneConfig, stream_factory: StreamFactory = sd.OutputStream) -> None:
+    def __init__(
+        self,
+        config: ToneConfig,
+        stream_factory: StreamFactory = sd.RawOutputStream,
+    ) -> None:
         self._config = config
         self._stream_factory = stream_factory
         self._generator = ToneGenerator(config)
@@ -265,7 +299,7 @@ class TonePlayer:
             self._state = PlayerState.PLAYING
 
     def stop(self) -> None:
-        """Остановить воспроизведение."""
+        """Остановить воспроизождение."""
         self._close_stream()
         self._generator.reset()
         self._state = PlayerState.IDLE
@@ -306,7 +340,7 @@ class TonePlayer:
 
     def _callback(
         self,
-        outdata: AudioBuffer,
+        outdata: object,
         frames: int,
         _time_info: object,
         status: sd.CallbackFlags,
@@ -314,23 +348,31 @@ class TonePlayer:
         """Обратный вызов PortAudio: заполнить очередной блок звука."""
         if status:
             self._last_status = str(status)
-        self.fill_buffer(outdata, frames)
+        self.fill_buffer(cast("MutableBuffer", outdata), frames)
 
-    def fill_buffer(self, outdata: AudioBuffer, frames: int = -1) -> None:
+    def fill_buffer(self, buffer: MutableBuffer, frames: int = -1) -> None:
         """Заполнить буфер вывода согласно текущему состоянию.
 
         Вызывается из потока PortAudio; в тестах метод используется напрямую.
         """
-        count = outdata.shape[0] if frames < 0 else min(frames, outdata.shape[0])
-        channels = outdata.shape[1]
+        channels = self._channels
+        capacity = len(buffer) // (_FRAME_SIZE * channels)
+        count = capacity if frames < 0 else min(frames, capacity)
+
         if self._state is not PlayerState.PLAYING:
-            outdata[:count] = 0.0
+            buffer[: _FRAME_SIZE * count * channels] = bytes(_FRAME_SIZE * count * channels)
             return
 
         block = self._generator.render(count)
-        outdata[:count, 0] = block
-        for channel in range(1, channels):
-            outdata[:count, channel] = block
+        if channels == 1:
+            payload = block.tobytes()
+        else:
+            spread = array("f", bytes(_FRAME_SIZE * count * channels))
+            for channel in range(channels):
+                spread[channel::channels] = block
+            payload = spread.tobytes()
+
+        buffer[: len(payload)] = payload
         if self._generator.finished:
             self._state = PlayerState.FINISHED
 
@@ -358,9 +400,8 @@ class TonePlayer:
                 errors.append(f"устройство {device}, каналов {channels}: {err}")
                 continue
 
-            if index == 0:
-                return stream, channels
-            self._last_status = "Открыт запасной вариант вывода — " + errors[-1]
+            if index > 0:
+                self._last_status = "Открыт запасной вариант вывода — " + errors[-1]
             return stream, channels
 
         raise AudioError("Не удалось открыть устройство вывода: " + "; ".join(errors))

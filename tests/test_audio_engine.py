@@ -1,9 +1,8 @@
 import math
 import sys
 import unittest
+from array import array
 from pathlib import Path
-
-import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -33,6 +32,24 @@ class FakeStream:
         self.closed = True
 
 
+class OutputBuffer:
+    """Буфер вывода для тестов: пишет звук так же, как буфер PortAudio."""
+
+    def __init__(self, size: int) -> None:
+        self.data = bytearray(size)
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __setitem__(self, key: slice, value: bytes) -> None:
+        self.data[key] = value
+
+    def samples(self, channels: int = 1) -> AudioBlock:
+        block = array("f")
+        block.frombytes(bytes(self.data))
+        return block[::channels]
+
+
 def make_config(
     frequencies: tuple[float, ...] = (500.0, 1000.0),
     gain_db: tuple[float, ...] = (-12.0, -12.0),
@@ -52,21 +69,21 @@ def make_config(
     )
 
 
-def fill(player: TonePlayer, frames: int) -> AudioBlock:
+def fill(player: TonePlayer, frames: int, channels: int = 1) -> AudioBlock:
     """Прогнать блок через буфер вывода и вернуть полученный звук."""
-    buffer = np.zeros((frames, 1), dtype=np.float32)
+    buffer = OutputBuffer(4 * frames * channels)
     player.fill_buffer(buffer)
-    return buffer[:, 0]
+    return buffer.samples(channels)
 
 
 def peak(chunk: AudioBlock) -> float:
     """Максимальный модуль сигнала в блоке."""
-    return float(max(abs(chunk.max()), abs(chunk.min())))
+    return max((abs(value) for value in chunk), default=0.0)
 
 
 def edges(chunk: AudioBlock) -> float:
     """Модули первого и последнего отсчётов блока."""
-    return float(max(abs(chunk[:1].max()), abs(chunk[-1:].max())))
+    return max((abs(value) for value in (chunk[0], chunk[-1])), default=0.0)
 
 
 def count_positive_crossings(chunk: AudioBlock) -> int:
@@ -114,8 +131,10 @@ class TestToneGenerator(unittest.TestCase):
 
         fade = int(0.02 * RATE)
         self.assertLess(edges(chunk), 1e-3)
-        self.assertLess(float(abs(chunk[: fade // 2].max())), 0.55)
-        self.assertGreater(float(abs(chunk[RATE // 2 : RATE // 2 + 100].max())), 0.9)
+        head = peak(chunk[: fade // 2])
+        middle = peak(chunk[RATE // 2 : RATE // 2 + 100])
+        self.assertLess(head, 0.55)
+        self.assertGreater(middle, 0.9)
 
     def test_tone_advances_after_duration(self) -> None:
         generator = ToneGenerator(make_config(seconds_per_tone=0.1))
@@ -320,15 +339,22 @@ class TestTonePlayer(unittest.TestCase):
 
     def test_stereo_buffer_gets_signal_in_both_channels(self) -> None:
         player = self._player()
+
+        def factory(**kwargs: object) -> FakeStream:
+            if kwargs.get("channels") == 1:
+                raise OSError("нет моно")
+            return FakeStream(**kwargs)
+
+        player = TonePlayer(make_config(), stream_factory=factory)
         _ = player.start()
-        buffer = np.zeros((512, 2), dtype=np.float32)
-
+        buffer = OutputBuffer(4 * 512 * 2)
         player.fill_buffer(buffer)
+        stereo = buffer.samples()
 
-        left = buffer[:, 0]
-        right = buffer[:, 1]
+        left = stereo[0::2]
+        right = stereo[1::2]
         self.assertGreater(peak(left), 0.0)
-        self.assertEqual(float((left - right).max()), 0.0)
+        self.assertEqual(peak(left), peak(right))
 
     def test_device_change_blocked_during_playback(self) -> None:
         player = self._player()

@@ -3,11 +3,7 @@ name = "tone-player"
 version = "0.1.0"
 description = "Генератор контрольных тонов для акустических измерений"
 requires-python = ">=3.15"
-dependencies = [
-    "numpy>=2.5.4",
-    "pyqt6>=6.11.0",
-    "sounddevice>=0.5.6",
-]
+dependencies = ["pyqt6>=6.11.0", "sounddevice>=0.5.6"]
 
 [dependency-groups]
 dev = ["basedpyright>=1.40.2", "ruff>=0.17.0"]
