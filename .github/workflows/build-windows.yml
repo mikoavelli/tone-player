@@ -104,6 +104,8 @@ jobs:
       # зависимости приложения: он нужен только на машине сборки.
       # На Windows patchelf не нужен, компилятор берётся из образа
       # windows-latest (Visual Studio Build Tools).
+      # Версия ниже должна совпадать с version в pyproject.toml: если заданы
+      # --product-name или --company-name, Nuitka требует и версию.
       - name: Сборка
         shell: pwsh
         run: |
@@ -114,6 +116,9 @@ jobs:
             --output-filename=TonePlayer `
             --company-name=TonePlayer `
             --product-name=TonePlayer `
+            --file-description="Генератор контрольных тонов" `
+            --file-version=0.1.0.0 `
+            --product-version=0.1.0.0 `
             --enable-plugin=pyqt6 `
             --include-qt-plugins=platforms,styles `
             --nofollow-import-to=tkinter `
