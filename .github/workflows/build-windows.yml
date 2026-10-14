@@ -1,0 +1,165 @@
+name: Сборка Windows
+
+# Сборка только по ручному запуску: workflow_dispatch без автоматических
+# триггеров на push, pull_request и расписание. Причина простая — сборка
+# PyQt6-приложения тяжёлая (десятки минут на оба варианта упаковки), а
+# повод запускать её появляется редко: перед выкаткой релиза или после
+# правок конфигурации сборки.
+#
+# Запуск: вкладка Actions -> Сборка Windows -> Run workflow.
+# В поле «Сборщик» можно выбрать один вариант упаковки вместо обоих.
+
+on:
+  workflow_dispatch:
+    inputs:
+      builder:
+        description: Что собирать
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - pyinstaller
+          - nuitka
+
+# Не копим несколько прогонов одного запуска: кнопку легко нажать дважды.
+concurrency:
+  group: build-windows
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  pyinstaller:
+    name: PyInstaller
+    if: inputs.builder == 'both' || inputs.builder == 'pyinstaller'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.15"
+
+      - name: Версии
+        run: |
+          uv --version
+          uv run python -V
+
+      - name: Зависимости сборки
+        run: uv sync --group build
+
+      - name: Сборка
+        run: uv run pyinstaller --clean TonePlayer.spec
+
+      - name: Подготовка артефакта
+        shell: pwsh
+        run: |
+          $out = "out/PyInstaller"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item "dist/TonePlayer.exe" $out
+          Copy-Item "config.toml" $out
+          $exe = Get-Item "$out/TonePlayer.exe"
+          "Размер: {0:N1} МБ" -f ($exe.Length / 1MB) | Write-Host
+          if ($exe.Length -lt 5MB) {
+            throw "Слишком маленький exe: $($exe.Length) байт"
+          }
+
+      - name: Артефакт
+        uses: actions/upload-artifact@v4
+        with:
+          name: TonePlayer-pyinstaller-${{ github.sha }}
+          path: out/PyInstaller/
+          if-no-files-found: error
+          retention-days: 30
+
+  nuitka:
+    name: Nuitka
+    if: inputs.builder == 'both' || inputs.builder == 'nuitka'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.15"
+
+      - name: Версии
+        run: |
+          uv --version
+          uv run python -V
+
+      - name: Зависимости
+        run: uv sync
+
+      # Nuitka ставится сюда через --with, чтобы не тащить его в
+      # зависимости приложения: он нужен только на машине сборки.
+      # На Windows patchelf не нужен, компилятор берётся из образа
+      # windows-latest (Visual Studio Build Tools).
+      - name: Сборка
+        shell: pwsh
+        run: |
+          uv run --with nuitka python -m nuitka `
+            --mode=onefile `
+            --assume-yes-for-downloads `
+            --output-dir=dist-nuitka `
+            --output-filename=TonePlayer `
+            --company-name=TonePlayer `
+            --product-name=TonePlayer `
+            --enable-plugin=pyqt6 `
+            --include-qt-plugins=platforms,styles `
+            --nofollow-import-to=tkinter `
+            --nofollow-import-to=unittest `
+            --nofollow-import-to=numpy `
+            --nofollow-import-to=PyQt6.QtQuick `
+            --nofollow-import-to=PyQt6.QtQml `
+            --nofollow-import-to=PyQt6.QtMultimedia `
+            --nofollow-import-to=PyQt6.QtMultimediaWidgets `
+            --nofollow-import-to=PyQt6.QtPdf `
+            --nofollow-import-to=PyQt6.QtWebEngineCore `
+            --nofollow-import-to=PyQt6.QtWebEngineWidgets `
+            --nofollow-import-to=PyQt6.QtNetwork `
+            --nofollow-import-to=PyQt6.QtOpenGL `
+            --nofollow-import-to=PyQt6.QtSql `
+            --nofollow-import-to=PyQt6.QtXml `
+            --nofollow-import-to=PyQt6.QtCharts `
+            --nofollow-import-to=PyQt6.QtDataVisualization `
+            --nofollow-import-to=PyQt6.QtDesigner `
+            --nofollow-import-to=PyQt6.QtHelp `
+            --nofollow-import-to=PyQt6.QtPrintSupport `
+            --nofollow-import-to=PyQt6.QtBluetooth `
+            --nofollow-import-to=PyQt6.QtPositioning `
+            --nofollow-import-to=PyQt6.QtSensors `
+            --nofollow-import-to=PyQt6.QtSerialPort `
+            --nofollow-import-to=PyQt6.QtWebChannel `
+            --nofollow-import-to=PyQt6.QtWebSockets `
+            src/main.py
+
+      - name: Подготовка артефакта
+        shell: pwsh
+        run: |
+          $out = "out/Nuitka"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item "dist-nuitka/TonePlayer.exe" $out
+          Copy-Item "config.toml" $out
+          $exe = Get-Item "$out/TonePlayer.exe"
+          "Размер: {0:N1} МБ" -f ($exe.Length / 1MB) | Write-Host
+          if ($exe.Length -lt 5MB) {
+            throw "Слишком маленький exe: $($exe.Length) байт"
+          }
+
+      - name: Артефакт
+        uses: actions/upload-artifact@v4
+        with:
+          name: TonePlayer-nuitka-${{ github.sha }}
+          path: out/Nuitka/
+          if-no-files-found: error
+          retention-days: 30
