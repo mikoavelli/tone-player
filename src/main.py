@@ -1,20 +1,18 @@
 import os
 import sys
-import time
 import traceback
+from contextlib import suppress
 from pathlib import Path
 from types import TracebackType
 
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
-from audio_engine import TonePlayer
 from config_loader import load_config
-from error import AudioError, ConfigError
-from models import ToneConfig
+from error import ConfigError
 from ui.main_window import MainWindow
 
-SELFTEST_LOG = "selftest.log"
+CONFIG_NAME = "config.toml"
 
 
 def handle_unhandled_exception(
@@ -37,38 +35,31 @@ def handle_unhandled_exception(
     _ = dialog.exec()
 
 
-def get_base_dir() -> Path:
+def config_candidates() -> list[Path]:
+    """Каталоги, где может лежать config.toml, в порядке приоритета.
+
+    Порядок зависит от упаковщика: у PyInstaller один файл — это
+    sys.executable, у Nuitka onefile — argv[0], при запуске из исходников —
+    корень проекта. Под Nuitka __file__ указывает во временный каталог
+    распаковки, поэтому он в конец списка.
+    """
+    candidates: list[Path] = []
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent.parent
+        candidates.append(Path(sys.executable).resolve().parent)
+    if sys.argv and sys.argv[0]:
+        with suppress(OSError):
+            candidates.append(Path(sys.argv[0]).resolve().parent)
+    candidates.append(Path(__file__).resolve().parent.parent)
+    return candidates
 
 
-def run_selftest(config: ToneConfig, base_dir: Path) -> int:
-    """Коротко проверить вывод звука без запуска окна."""
-    lines: list[str] = []
-    player = TonePlayer(config)
-    lines.append(f"Устройство вывода: {player.device_name}")
-    lines.append(f"Тонов: {config.tone_count} по {config.seconds_per_tone:.1f} с")
-    try:
-        player.start()
-        time.sleep(1.0)
-        progress = player.progress()
-        lines.append(f"Состояние: {player.state.value}")
-        lines.append(f"Частота: {player.current_frequency:.0f} Гц")
-        lines.append(f"Позиция в тоне: {progress.tone_elapsed:.2f} с")
-        if player.last_status:
-            lines.append(f"Замечания PortAudio: {player.last_status}")
-        player.stop()
-        lines.append("Проверка пройдена")
-        code = 0
-    except AudioError as error:
-        lines.append(f"Ошибка: {error}")
-        code = 1
-
-    report = "\n".join(lines)
-    (base_dir / SELFTEST_LOG).write_text(report + "\n", encoding="utf-8")
-    print(report)
-    return code
+def get_base_dir() -> Path:
+    """Каталог с конфигурацией: первый, где реально лежит config.toml."""
+    candidates = config_candidates()
+    for candidate in candidates:
+        if (candidate / CONFIG_NAME).is_file():
+            return candidate
+    return candidates[0]
 
 
 def main() -> int:
@@ -76,13 +67,10 @@ def main() -> int:
     os.chdir(base_dir)
 
     try:
-        config = load_config(base_dir / "config.toml")
+        config = load_config(base_dir / CONFIG_NAME)
     except ConfigError as error:
-        print(f"Ошибка конфигурации: {error}")
+        _ = QMessageBox.critical(None, "Ошибка конфигурации", str(error))
         return 1
-
-    if "--selftest" in sys.argv:
-        return run_selftest(config, base_dir)
 
     sys.excepthook = handle_unhandled_exception
 
