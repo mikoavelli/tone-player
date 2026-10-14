@@ -4,18 +4,18 @@ version = "0.1.0"
 description = "Генератор контрольных тонов для акустических измерений"
 requires-python = ">=3.15"
 dependencies = [
-    "numpy>=2.3.0",
+    "numpy>=2.5.4",
     "pyqt6>=6.11.0",
-    "sounddevice>=0.5.2",
+    "sounddevice>=0.5.6",
 ]
 
 [dependency-groups]
-dev = ["basedpyright>=1.40.0", "ruff>=0.16.6"]
-build = ["pyinstaller>=6.14.0"]
+dev = ["basedpyright>=1.40.2", "ruff>=0.17.0"]
+build = ["pyinstaller>=6.22.3"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py313"
+target-version = "py315"
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "UP", "S", "B", "N"]
@@ -25,7 +25,7 @@ select = ["E", "W", "F", "I", "UP", "S", "B", "N"]
 
 [tool.basedpyright]
 include = ["src", "tests"]
-pythonVersion = "3.13"
+pythonVersion = "3.15"
 stubPath = "stubs"
 typeCheckingMode = "strict"
 failOnWarnings = true
