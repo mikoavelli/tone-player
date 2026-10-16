@@ -109,8 +109,9 @@ jobs:
       - name: Сборка
         shell: pwsh
         run: |
-          uv run --with nuitka python -m nuitka `
+          uv run --with "nuitka==4.3" python -m nuitka `
             --mode=onefile `
+            --windows-console-mode=disable `
             --assume-yes-for-downloads `
             --output-dir=dist-nuitka `
             --output-filename=TonePlayer `
