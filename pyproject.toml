@@ -2,16 +2,16 @@
 name = "tone-player"
 version = "0.1.0"
 description = "Генератор контрольных тонов для акустических измерений"
-requires-python = ">=3.15"
-dependencies = ["pyqt6>=6.11.0", "sounddevice>=0.5.6"]
+requires-python = "==3.14.8"
+dependencies = ["pyqt6==6.11.0", "sounddevice==0.5.6"]
 
 [dependency-groups]
-dev = ["basedpyright>=1.40.2", "ruff>=0.17.0"]
-build = ["pyinstaller>=6.22.3"]
+dev = ["basedpyright==1.40.2", "ruff==0.17.1"]
+build = ["pyinstaller==6.22.3", "nuitka==4.3"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py315"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "UP", "S", "B", "N"]
@@ -21,7 +21,7 @@ select = ["E", "W", "F", "I", "UP", "S", "B", "N"]
 
 [tool.basedpyright]
 include = ["src", "tests"]
-pythonVersion = "3.15"
+pythonVersion = "3.14"
 stubPath = "stubs"
 typeCheckingMode = "strict"
 failOnWarnings = true
