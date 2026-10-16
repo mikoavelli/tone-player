@@ -125,7 +125,15 @@ class ToneGenerator:
 
     def reset(self) -> None:
         """Вернуться к началу последовательности."""
-        self.index = 0
+        self.seek(0)
+
+    def seek(self, index: int) -> None:
+        """Перейти к тону по индексу, не воспроизводя его.
+
+        Индекс ограничивается списком частот: значения вне диапазона дают
+        первый или последний тон.
+        """
+        self.index = min(max(index, 0), self._config.tone_count - 1)
         self.frames_in_tone = 0
         self.finished = False
         self._phase = 0.0
@@ -193,10 +201,10 @@ class TonePlayer:
     def __init__(
         self,
         config: ToneConfig,
-        stream_factory: StreamFactory = sd.RawOutputStream,
+        stream_factory: StreamFactory | None = None,
     ) -> None:
         self._config = config
-        self._stream_factory = stream_factory
+        self._stream_factory = sd.RawOutputStream if stream_factory is None else stream_factory
         self._generator = ToneGenerator(config)
         self._state = PlayerState.IDLE
         self._device: int | str | None = config.device
@@ -230,14 +238,12 @@ class TonePlayer:
 
     @property
     def tone_index(self) -> int:
-        """Индекс текущего тона."""
+        """Индекс выбранного тона: текущий при воспроизведении, иначе выбранный вручную."""
         return min(self._generator.index, self._config.tone_count - 1)
 
     @property
     def current_frequency(self) -> float:
-        """Частота текущего тона, Гц."""
-        if self._state is PlayerState.IDLE:
-            return 0.0
+        """Частота выбранного тона, Гц."""
         return self._config.frequency_at(self.tone_index)
 
     @property
@@ -270,10 +276,10 @@ class TonePlayer:
     # Управление
     # -------------------------------------------------------------------------
 
-    def start(self) -> None:
-        """Начать воспроизведение с первой частоты."""
+    def start(self, index: int = 0) -> None:
+        """Начать воспроизведение с тона index (по умолчанию с первого)."""
         self._close_stream()
-        self._generator.reset()
+        self._generator.seek(index)
         self._last_status = ""
 
         stream, channels = self._open_stream()
@@ -287,6 +293,17 @@ class TonePlayer:
             self._state = PlayerState.IDLE
             self._close_stream()
             raise AudioError(f"Не удалось запустить воспроизведение: {err}") from err
+
+    def select(self, index: int) -> None:
+        """Перейти к тону по индексу без воспроизведения.
+
+        Если звук шёл, он прекращается: тон остаётся выбранным, а запуск
+        выполняется кнопкой «Старт».
+        """
+        if self._state in (PlayerState.PLAYING, PlayerState.PAUSED):
+            self._close_stream()
+        self._generator.seek(index)
+        self._state = PlayerState.IDLE
 
     def pause(self) -> None:
         """Приостановить воспроизведение."""

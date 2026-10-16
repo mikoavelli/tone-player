@@ -165,6 +165,25 @@ class TestToneGenerator(unittest.TestCase):
         self.assertEqual(generator.frames_in_tone, 0)
         self.assertFalse(generator.finished)
 
+    def test_seek_moves_to_tone(self) -> None:
+        generator = ToneGenerator(make_config())
+
+        generator.seek(1)
+
+        self.assertEqual(generator.index, 1)
+        self.assertEqual(generator.frames_in_tone, 0)
+        self.assertFalse(generator.finished)
+
+    def test_seek_after_finish_clears_finished(self) -> None:
+        generator = ToneGenerator(make_config(seconds_per_tone=0.05))
+        _ = generator.render(int(RATE * 0.1))
+        self.assertTrue(generator.finished)
+
+        generator.seek(1)
+
+        self.assertFalse(generator.finished)
+        self.assertEqual(generator.index, 1)
+
 
 class TestTonePlayer(unittest.TestCase):
     def _player(self, config: ToneConfig | None = None) -> TonePlayer:
@@ -177,7 +196,8 @@ class TestTonePlayer(unittest.TestCase):
 
         self.assertEqual(peak(buffer), 0.0)
         self.assertEqual(player.state, PlayerState.IDLE)
-        self.assertEqual(player.current_frequency, 0.0)
+        self.assertEqual(player.current_frequency, 500.0)
+        self.assertEqual(player.tone_index, 0)
 
     def test_pause_outputs_silence(self) -> None:
         player = self._player()
@@ -275,7 +295,69 @@ class TestTonePlayer(unittest.TestCase):
 
         self.assertEqual(player.state, PlayerState.IDLE)
         self.assertEqual(player.progress().total_elapsed, 0.0)
-        self.assertEqual(player.current_frequency, 0.0)
+        self.assertEqual(player.current_frequency, 500.0)
+        self.assertEqual(player.tone_index, 0)
+
+    def test_start_from_index_plays_that_tone(self) -> None:
+        player = self._player(make_config(seconds_per_tone=0.05))
+
+        _ = player.start(1)
+
+        self.assertEqual(player.state, PlayerState.PLAYING)
+        self.assertEqual(player.tone_index, 1)
+        self.assertEqual(player.current_frequency, 1000.0)
+
+        _ = fill(player, int(RATE * 0.05))
+
+        self.assertEqual(player.state, PlayerState.FINISHED)
+
+    def test_select_moves_position_without_sound(self) -> None:
+        player = self._player()
+
+        player.select(1)
+
+        self.assertEqual(player.state, PlayerState.IDLE)
+        self.assertEqual(player.tone_index, 1)
+        self.assertEqual(player.current_frequency, 1000.0)
+        self.assertEqual(peak(fill(player, 256)), 0.0)
+
+    def test_select_stops_playback(self) -> None:
+        streams: list[FakeStream] = []
+
+        def factory(**kwargs: object) -> FakeStream:
+            stream = FakeStream(**kwargs)
+            streams.append(stream)
+            return stream
+
+        player = TonePlayer(make_config(), stream_factory=factory)
+        _ = player.start()
+
+        player.select(1)
+
+        self.assertEqual(player.state, PlayerState.IDLE)
+        self.assertTrue(streams[0].stopped)
+        self.assertTrue(streams[0].closed)
+
+    def test_select_bounds(self) -> None:
+        player = self._player()
+
+        player.select(-3)
+        self.assertEqual(player.tone_index, 0)
+
+        player.select(42)
+        self.assertEqual(player.tone_index, 1)
+        self.assertEqual(player.current_frequency, 1000.0)
+
+    def test_selected_tone_keeps_progress(self) -> None:
+        player = self._player(make_config(seconds_per_tone=1.0))
+
+        player.select(1)
+
+        progress = player.progress()
+        self.assertEqual(progress.tone_index, 1)
+        self.assertEqual(progress.tone_elapsed, 0.0)
+        self.assertAlmostEqual(progress.total_elapsed, 1.0, delta=1e-6)
+        self.assertAlmostEqual(progress.total_remaining, 1.0, delta=1e-6)
 
     def test_finish_keeps_final_position(self) -> None:
         player = self._player(make_config(seconds_per_tone=0.05))

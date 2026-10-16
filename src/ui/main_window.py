@@ -7,6 +7,7 @@ from typing import Protocol, cast
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QHBoxLayout,
     QLabel,
@@ -19,7 +20,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from audio_engine import DEFAULT_DEVICE_LABEL, TonePlayer, list_output_devices
+from audio_engine import DEFAULT_DEVICE_LABEL, StreamFactory, TonePlayer, list_output_devices
 from error import AudioError
 from models import PlayerState, ToneConfig
 
@@ -95,6 +96,28 @@ QComboBox QAbstractItemView {
     border: 1px solid #454b54;
     selection-background-color: #3c424a;
 }
+QPushButton#navButton {
+    padding: 9px 0;
+    font-size: 18px;
+    font-weight: 600;
+}
+QCheckBox {
+    spacing: 8px;
+}
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid #454b54;
+    border-radius: 4px;
+    background-color: #31363d;
+}
+QCheckBox::indicator:checked {
+    background-color: #4a90d9;
+    border-color: #6ec1ff;
+}
+QCheckBox:disabled {
+    color: #61686f;
+}
 """
 
 
@@ -117,15 +140,20 @@ def connect_index(signal: IntSignal, slot: Callable[[int], None]) -> None:
 class MainWindow(QMainWindow):
     """Окно с управлением воспроизведением и индикацией текущей частоты."""
 
-    def __init__(self, config: ToneConfig, base_directory: Path) -> None:
+    def __init__(
+        self,
+        config: ToneConfig,
+        base_directory: Path,
+        stream_factory: StreamFactory | None = None,
+    ) -> None:
         super().__init__()
         self._config = config
         self._base_directory = base_directory
-        self._player = TonePlayer(config)
+        self._player = TonePlayer(config, stream_factory=stream_factory)
         self._finishing_handled = False
 
         self.setWindowTitle("TonePlayer")
-        self.resize(560, 520)
+        self.resize(560, 560)
         self.setStyleSheet(_STYLESHEET)
 
         self._build_ui()
@@ -157,10 +185,29 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(14)
 
+        frequency_row = QHBoxLayout()
+        frequency_row.setSpacing(10)
+
+        self.previous_button = QPushButton("◀")
+        self.previous_button.setObjectName("navButton")
+        self.previous_button.setFixedWidth(64)
+        self.previous_button.setToolTip("Предыдущая частота")
+        connect_action(self.previous_button.clicked, self._on_previous_tone)
+        frequency_row.addWidget(self.previous_button)
+
         self.frequency_label = QLabel("—")
         self.frequency_label.setObjectName("frequencyLabel")
         self.frequency_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.frequency_label)
+        frequency_row.addWidget(self.frequency_label, 1)
+
+        self.next_button = QPushButton("▶")
+        self.next_button.setObjectName("navButton")
+        self.next_button.setFixedWidth(64)
+        self.next_button.setToolTip("Следующая частота")
+        connect_action(self.next_button.clicked, self._on_next_tone)
+        frequency_row.addWidget(self.next_button)
+
+        layout.addLayout(frequency_row)
 
         self.tone_label = QLabel()
         self.tone_label.setObjectName("toneLabel")
@@ -191,6 +238,14 @@ class MainWindow(QMainWindow):
         for button in (self.start_button, self.pause_button, self.stop_button):
             buttons.addWidget(button)
         layout.addLayout(buttons)
+
+        self.autoplay_checkbox = QCheckBox("Автовоспроизведение при переключении")
+        self.autoplay_checkbox.setToolTip(
+            "Включено: переключение частоты сразу её воспроизводит.\n"
+            "Выключено: частота переключается без звука, запуск — кнопкой «Старт»."
+        )
+        self.autoplay_checkbox.setChecked(True)
+        layout.addWidget(self.autoplay_checkbox)
 
         level_row = QHBoxLayout()
         level_row.setSpacing(8)
@@ -236,8 +291,33 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------------------
 
     def _on_start(self) -> None:
+        # После завершения сеанса «Старт» запускает всё заново с первой
+        # частоты, после ручного переключения — с выбранной.
+        index = 0 if self._player.state is PlayerState.FINISHED else self._player.tone_index
+        self._start_playback(index)
+
+    def _on_previous_tone(self) -> None:
+        self._navigate(-1)
+
+    def _on_next_tone(self) -> None:
+        self._navigate(1)
+
+    def _navigate(self, offset: int) -> None:
+        """Сменить выбранную частоту, воспроизводя её при включённом автозапуске."""
+        index = min(max(self._player.tone_index + offset, 0), self._config.tone_count - 1)
+        if index == self._player.tone_index:
+            return
+        if self.autoplay_checkbox.isChecked():
+            self._start_playback(index)
+            return
+        self._player.select(index)
+        self._finishing_handled = False
+        self._refresh()
+
+    def _start_playback(self, index: int) -> None:
+        """Запустить воспроизведение с тона index, показав ошибку устройства."""
         try:
-            self._player.start()
+            self._player.start(index)
         except AudioError as error:
             _ = QMessageBox.critical(self, "Ошибка воспроизведения", str(error))
             return
@@ -282,10 +362,7 @@ class MainWindow(QMainWindow):
             state = self._player.state
             progress = self._player.progress()
 
-        if state is PlayerState.IDLE:
-            self.frequency_label.setText("—")
-        else:
-            self.frequency_label.setText(format_frequency(self._player.current_frequency))
+        self.frequency_label.setText(format_frequency(self._player.current_frequency))
 
         self.tone_label.setText(f"Тон {progress.tone_index + 1} из {self._config.tone_count}")
         self.remaining_label.setText(
@@ -299,6 +376,8 @@ class MainWindow(QMainWindow):
         self.pause_button.setEnabled(state in (PlayerState.PLAYING, PlayerState.PAUSED))
         self.stop_button.setEnabled(state in (PlayerState.PLAYING, PlayerState.PAUSED))
         self.device_selector.setEnabled(state not in (PlayerState.PLAYING, PlayerState.PAUSED))
+        self.previous_button.setEnabled(progress.tone_index > 0)
+        self.next_button.setEnabled(progress.tone_index < self._config.tone_count - 1)
         self.pause_button.setText("Продолжить" if state is PlayerState.PAUSED else "Пауза")
 
         self.status_label.setText(self._player.last_status)
