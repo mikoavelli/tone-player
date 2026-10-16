@@ -1,12 +1,8 @@
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
-from config_loader import load_config  # noqa: E402
-from error import ConfigNotFoundError, ConfigValidationError  # noqa: E402
+from tests.bootstrap import ConfigNotFoundError, ConfigValidationError, load_config
 
 VALID_CONFIG = """
 [playback]

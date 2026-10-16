@@ -5,6 +5,8 @@ CallbackFunction = Callable[..., None]
 
 DEFAULT_SAMPLERATE: float
 
+class PortAudioError(Exception): ...
+
 class CallbackFlags:
     input_overflow: bool
     output_underflow: bool
