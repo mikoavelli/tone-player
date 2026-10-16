@@ -51,13 +51,21 @@ class AudioStream(Protocol):
 
 StreamFactory = Callable[..., AudioStream]
 
+# Широта нужна: звуковая библиотека может бросить PortAudioError, OSError
+# (нет PortAudio-библиотеки) или ValueError на неожиданном устройстве.
+PORTAUDIO_ERRORS: tuple[type[Exception], ...] = (
+    sd.PortAudioError,
+    OSError,
+    ValueError,
+)
+
 
 def list_output_devices() -> list[tuple[int, str]]:
     """Список устройств вывода PortAudio: индекс и название."""
     devices: list[tuple[int, str]] = []
     try:
         entries = sd.query_devices()
-    except Exception:  # noqa: BLE001 - список устройств только для выбора в окне
+    except PORTAUDIO_ERRORS:
         return devices
 
     for index, entry in enumerate(entries):
@@ -72,8 +80,9 @@ def list_output_devices() -> list[tuple[int, str]]:
 class ToneGenerator:
     """Формирование сигнала тона: частота, калибровка уровня, плавные переходы."""
 
-    def __init__(self, config: ToneConfig) -> None:
+    def __init__(self, config: ToneConfig, *, autoplay_enabled: bool = True) -> None:
         self._config = config
+        self._autoplay_enabled = autoplay_enabled
         self._offset_db = config.default_offset_db
         self.index = 0
         self.frames_in_tone = 0
@@ -108,6 +117,18 @@ class ToneGenerator:
     def amplitude(self) -> float:
         """Амплитуда текущего тона, 0.0..1.0."""
         return min(math.pow(10.0, self.current_gain_db / 20.0), 1.0)
+
+    def advance_allowed(self) -> bool:
+        """Может ли автоматически начинаться следующая частота."""
+        return self._autoplay_enabled
+
+    def set_autoplay(self, enabled: bool) -> None:
+        """Разрешить (или запретить) автоматическое воспроизведение следующей частоты."""
+        self._autoplay_enabled = enabled
+
+    def _advance_allowed(self) -> bool:
+        """Может ли автоматически начинаться следующая частота."""
+        return self._autoplay_enabled
 
     @property
     def fade_frames(self) -> int:
@@ -144,7 +165,11 @@ class ToneGenerator:
         written = 0
         while written < frames and not self.finished:
             if self.frames_in_tone >= self.tone_length_frames:
-                self._advance()
+                if self.advance_allowed():
+                    self._advance()
+                else:
+                    # Автовоспроизведение выключено: следующая частота не начинается.
+                    self.finished = True
                 continue
             count = min(frames - written, self.tone_length_frames - self.frames_in_tone)
             self._render_tone(block, written, count)
@@ -152,7 +177,11 @@ class ToneGenerator:
             self.frames_in_tone += count
 
         if not self.finished and self.frames_in_tone >= self.tone_length_frames:
-            self._advance()
+            if self._advance_allowed():
+                self._advance()
+            else:
+                # Автовоспроизведение выключено: следующая частота не начинается.
+                self.finished = True
         return block
 
     # -------------------------------------------------------------------------
@@ -267,6 +296,10 @@ class TonePlayer:
             raise AudioError("Устройство вывода нельзя сменить во время воспроизведения.")
         self._device = device
 
+    def set_autoplay(self, enabled: bool) -> None:
+        """Разрешить (или запретить) автоматическое воспроизведение следующей частоты."""
+        self._generator.set_autoplay(enabled)
+
     @property
     def last_status(self) -> str:
         """Последнее сообщение потока PortAudio, если оно было."""
@@ -277,10 +310,21 @@ class TonePlayer:
     # -------------------------------------------------------------------------
 
     def start(self, index: int = 0) -> None:
-        """Начать воспроизведение с тона index (по умолчанию с первого)."""
+        """Начать или перенастроить воспроизведение с тона index.
+
+        Если поток вывода уже открыт (идёт воспроизведение или пауза), он не
+        переоткрывается: генератор просто переводится на нужный тон. Поэтому при
+        воспроизведении текущая частота обрывается и сразу звучит новая, а на
+        паузе звук остаётся тихим — новая частота зазвучит после продолжения.
+        """
+        self._last_status = ""
+
+        if self._state in (PlayerState.PLAYING, PlayerState.PAUSED) and self._stream is not None:
+            self._generator.seek(index)
+            return
+
         self._close_stream()
         self._generator.seek(index)
-        self._last_status = ""
 
         stream, channels = self._open_stream()
         self._channels = channels
@@ -298,9 +342,13 @@ class TonePlayer:
         """Перейти к тону по индексу без воспроизведения.
 
         Если звук шёл, он прекращается: тон остаётся выбранным, а запуск
-        выполняется кнопкой «Старт».
+        выполняется кнопкой «Старт». На паузе воспроизведение не прерывается —
+        меняется только выбранный тон.
         """
-        if self._state in (PlayerState.PLAYING, PlayerState.PAUSED):
+        if self._state is PlayerState.PAUSED:
+            self._generator.seek(index)
+            return
+        if self._state is PlayerState.PLAYING:
             self._close_stream()
         self._generator.seek(index)
         self._state = PlayerState.IDLE
@@ -330,18 +378,22 @@ class TonePlayer:
         self._generator.set_offset_db(offset_db)
 
     def progress(self) -> PlaybackProgress:
-        """Текущее положение воспроизведения."""
+        """Текущее положение воспроизведения.
+
+        Позиция всегда берётся из фактического состояния генератора: сеанс мог
+        закончиться раньше конца списка (например, при выключенном
+        автовоспроизведении), поэтому завершение не привязано к последнему тону.
+        """
+        index = self.tone_index
+        tone_elapsed = self._generator.frames_in_tone / self._config.sample_rate
         if self._state is PlayerState.FINISHED:
-            index = self._config.tone_count - 1
+            # Завершённый тон показывается пройденным целиком.
             tone_elapsed = self._config.seconds_per_tone
-        else:
-            index = self.tone_index
-            tone_elapsed = self._generator.frames_in_tone / self._config.sample_rate
-        tone_remaining = max(self._config.seconds_per_tone - tone_elapsed, 0.0)
         total_elapsed = min(
             tone_elapsed + index * self._config.seconds_per_tone,
             self._config.total_seconds,
         )
+        tone_remaining = max(self._config.seconds_per_tone - tone_elapsed, 0.0)
         total_remaining = max(self._config.total_seconds - total_elapsed, 0.0)
         return PlaybackProgress(
             tone_index=index,
@@ -413,7 +465,7 @@ class TonePlayer:
                     dtype="float32",
                     callback=self._callback,
                 )
-            except Exception as err:  # noqa: BLE001 - перебираем варианты открытия
+            except PORTAUDIO_ERRORS as err:
                 errors.append(f"устройство {device}, каналов {channels}: {err}")
                 continue
 
@@ -431,13 +483,13 @@ class TonePlayer:
         try:
             stream.stop()
             stream.close()
-        except Exception as err:  # noqa: BLE001 - закрытие потока не должно ронять приложение
+        except PORTAUDIO_ERRORS as err:
             self._last_status = f"Ошибка закрытия потока: {err}"
 
     def _resolve_device_name(self) -> str:
         try:
             info = sd.query_devices(self._device, "output")
-        except Exception:  # noqa: BLE001 - имя устройства только для информации
+        except PORTAUDIO_ERRORS:
             return DEFAULT_DEVICE_LABEL
         name: object = info.get("name")
         return str(name) if name else DEFAULT_DEVICE_LABEL

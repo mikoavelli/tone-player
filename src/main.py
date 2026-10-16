@@ -66,19 +66,22 @@ def main() -> int:
     base_dir = get_base_dir()
     os.chdir(base_dir)
 
+    # QApplication создаётся до чтения конфигурации: сообщение об ошибке
+    # показывается через QMessageBox, а любой виджет требует готового
+    # приложения.
+    app = QApplication(sys.argv)
+    _ = app.setStyle("Fusion")
+    app.setFont(QFont("Segoe UI", 9))
+
+    sys.excepthook = handle_unhandled_exception
+
     try:
         config = load_config(base_dir / CONFIG_NAME)
     except ConfigError as error:
         _ = QMessageBox.critical(None, "Ошибка конфигурации", str(error))
         return 1
 
-    sys.excepthook = handle_unhandled_exception
-
-    app = QApplication(sys.argv)
-    _ = app.setStyle("Fusion")
-    app.setFont(QFont("Segoe UI", 9))
-
-    window = MainWindow(config=config, base_directory=base_dir)
+    window = MainWindow(config=config)
     window.show()
     return app.exec()
 

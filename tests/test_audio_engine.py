@@ -1,14 +1,15 @@
 import math
-import sys
 import unittest
 from array import array
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
-from audio_engine import AudioBlock, ToneGenerator, TonePlayer  # noqa: E402
-from error import AudioError  # noqa: E402
-from models import PlayerState, ToneConfig  # noqa: E402
+from tests.bootstrap import (
+    AudioBlock,
+    AudioError,
+    PlayerState,
+    ToneConfig,
+    ToneGenerator,
+    TonePlayer,
+)
 
 RATE = 48000
 
@@ -154,6 +155,25 @@ class TestToneGenerator(unittest.TestCase):
         self.assertTrue(generator.finished)
         self.assertGreater(peak(chunk), 0.0)
         self.assertEqual(generator.index, 2)
+
+    def test_autoplay_enabled_by_default(self) -> None:
+        generator = ToneGenerator(make_config(seconds_per_tone=0.05))
+
+        generator.set_autoplay(True)
+        _ = generator.render(int(RATE * 0.1))
+        self.assertGreaterEqual(generator.index, 1)
+
+        generator.set_autoplay(False)
+        generator.seek(0)
+        _ = generator.render(int(RATE * 0.05) + 10)
+        self.assertTrue(generator.finished)
+        self.assertEqual(generator.index, 0)
+
+        generator.set_autoplay(True)
+        generator.seek(0)
+        _ = generator.render(int(RATE * 0.05))
+        self.assertFalse(generator.finished)
+        self.assertGreaterEqual(generator.index, 1)
 
     def test_reset_returns_to_start(self) -> None:
         generator = ToneGenerator(make_config(seconds_per_tone=0.05))
@@ -311,6 +331,69 @@ class TestTonePlayer(unittest.TestCase):
 
         self.assertEqual(player.state, PlayerState.FINISHED)
 
+    def test_switch_tone_while_playing_retunes_same_stream(self) -> None:
+        """Переключение тона во время игры меняет частоту, не переоткрывая поток."""
+        streams: list[FakeStream] = []
+
+        def factory(**kwargs: object) -> FakeStream:
+            stream = FakeStream(**kwargs)
+            streams.append(stream)
+            return stream
+
+        player = TonePlayer(make_config(seconds_per_tone=1.0), stream_factory=factory)
+        _ = player.start()
+        _ = fill(player, 256)
+
+        _ = player.start(1)
+
+        self.assertEqual(len(streams), 1)
+        self.assertFalse(streams[0].stopped)
+        self.assertFalse(streams[0].closed)
+        self.assertEqual(player.state, PlayerState.PLAYING)
+        self.assertEqual(player.tone_index, 1)
+        self.assertEqual(player.current_frequency, 1000.0)
+        self.assertGreater(peak(fill(player, 4800)), 0.0)
+
+    def test_switch_tone_while_paused_stays_silent(self) -> None:
+        """На паузе переключение меняет тон, но не запускает звук."""
+        streams: list[FakeStream] = []
+
+        def factory(**kwargs: object) -> FakeStream:
+            stream = FakeStream(**kwargs)
+            streams.append(stream)
+            return stream
+
+        player = TonePlayer(make_config(seconds_per_tone=1.0), stream_factory=factory)
+        _ = player.start()
+        _ = fill(player, 256)
+        player.pause()
+
+        _ = player.start(1)
+
+        self.assertEqual(player.state, PlayerState.PAUSED)
+        self.assertEqual(player.tone_index, 1)
+        self.assertEqual(player.current_frequency, 1000.0)
+        self.assertEqual(len(streams), 1)
+        self.assertFalse(streams[0].stopped)
+        self.assertEqual(peak(fill(player, 4800)), 0.0)
+
+        player.resume()
+
+        self.assertGreater(peak(fill(player, 4800)), 0.0)
+
+    def test_select_while_paused_keeps_pause(self) -> None:
+        """На паузе выбор другого тона не прерывает паузу и не даёт звука."""
+        player = self._player(make_config(seconds_per_tone=1.0))
+        _ = player.start()
+        _ = fill(player, 256)
+        player.pause()
+
+        player.select(1)
+
+        self.assertEqual(player.state, PlayerState.PAUSED)
+        self.assertEqual(player.tone_index, 1)
+        self.assertEqual(peak(fill(player, 4800)), 0.0)
+
     def test_select_moves_position_without_sound(self) -> None:
         player = self._player()
 
@@ -369,6 +452,26 @@ class TestTonePlayer(unittest.TestCase):
         self.assertEqual(player.state, PlayerState.FINISHED)
         self.assertEqual(player.progress().tone_index, 1)
         self.assertEqual(player.progress().total_remaining, 0.0)
+
+    def test_finish_before_list_end_shows_played_tone(self) -> None:
+        """Автовоспроизведение выключено: сеанс заканчивается текущим тоном.
+
+        Прогресс не должен прыгать на последний тон и показывать весь сеанс
+        пройденным, пока играет только первая частота.
+        """
+        player = self._player(make_config(seconds_per_tone=0.05))
+        _ = player.start()
+        player.set_autoplay(False)
+
+        _ = fill(player, int(RATE * 0.05))
+
+        self.assertEqual(player.state, PlayerState.FINISHED)
+        progress = player.progress()
+        self.assertEqual(progress.tone_index, 0)
+        self.assertEqual(player.current_frequency, 500.0)
+        self.assertAlmostEqual(progress.tone_remaining, 0.0)
+        self.assertAlmostEqual(progress.total_elapsed, 0.05, delta=1e-6)
+        self.assertAlmostEqual(progress.total_remaining, 0.05, delta=1e-6)
 
     def test_current_frequency_follows_tone(self) -> None:
         player = self._player(make_config(seconds_per_tone=0.05))

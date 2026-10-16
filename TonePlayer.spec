@@ -2,9 +2,16 @@
 """Сборка TonePlayer.
 
 Приложению нужен только Qt Widgets, поэтому из поставки Qt убираются модули и
-плагины, которые всё равно не загружаются. Это основной источник уменьшения
-размера: Qt Widgets тянет за собой Qt6Pdf, Qt6Network, Qt6OpenGL, Qt6Multimedia,
-Wayland, GTK и медиаплагины.
+плагины, которые всё равно не загружаются: Qt6Pdf, Qt6OpenGL, Qt6Multimedia,
+Qt6Qml и остальные неиспользуемые модули, а из плагинов остаются платформенные,
+стили и методы ввода. Это основной источник уменьшения размера.
+
+Платформенные плагины зависят от системы: на Windows это windows, windowsv3,
+minimal и offscreen, на Linux — xcb, wayland, minimal и offscreen. Wayland
+оставлен потому, что в Wayland-сессии Qt выбирает его по умолчанию (и часто
+через переменную QT_QPA_PLATFORM), а без плагина приложение не запускается.
+К wayland-плагину прилагаются shell-интеграция xdg-shell и оформление окна:
+без них Qt не может создать окно.
 
 Для отладки сборки удобно временно заменить EXE(... exclude_binaries=True) и
 добавить COLLECT: так появляется каталог _internal, где видно, что уехало.
@@ -57,7 +64,18 @@ EXCLUDED_MODULES = [
 ]
 
 # Qt-библиотеки, необходимые приложению.
-QT_LIB_PREFIXES = ("Qt6Core", "Qt6Gui", "Qt6Widgets", "Qt6DBus", "Qt6Network")
+# Qt6XcbQpa и Qt6WaylandClient — не отдельные модули, а части плагинов
+# платформы: без первой не грузится libqxcb.so (он подхватывает системный Qt
+# другой версии), без второй — libqwayland.so.
+QT_LIB_PREFIXES = (
+    "Qt6Core",
+    "Qt6Gui",
+    "Qt6Widgets",
+    "Qt6DBus",
+    "Qt6Network",
+    "Qt6XcbQpa",
+    "Qt6WaylandClient",
+)
 
 # Qt6Core связан с ICU, который лежит рядом с Qt-библиотеками.
 QT_LIB_SUBSTRINGS = ("icu",)
@@ -65,19 +83,28 @@ QT_LIB_SUBSTRINGS = ("icu",)
 # Платформенные плагины, которые остаются в сборке (без префиксов lib/q).
 PLATFORM_PLUGINS = {
     "windows": ("windows", "windowsv3", "minimal", "offscreen"),
-    "linux": ("xcb", "minimal", "offscreen"),
+    "linux": ("xcb", "wayland", "minimal", "offscreen"),
 }
 
-# Каталоги плагинов Qt, которые остаются в сборке.
-KEPT_PLUGIN_DIRS = ("platforms", "styles", "platforminputcontexts")
+# Каталоги плагинов Qt, которые остаются в сборке целиком.
+KEPT_PLUGIN_DIRS = ("styles", "platforminputcontexts")
+
+# Плагины Wayland: нужны только на Linux и не целиком.
+# xdg-shell — оболочка обычных рабочих столов, bradient и adwaita — отрисовка
+# заголовка окна (в niri и других композиторах без серверного оформления окно
+# иначе остаётся без рамки), qt-plugin-wayland-egl — вывод через EGL.
+WAYLAND_PLUGIN_FILES = {
+    "wayland-shell-integration": ("xdg-shell",),
+    "wayland-decoration-client": ("bradient", "adwaita"),
+}
 
 # Внешние библиотеки, которые тянутся только выкинутыми плагинами Qt.
-# Х11-библиотеки нужны плагину xcb, поэтому они не трогаются.
+# X11-библиотеки нужны плагину xcb, libwayland-* — плагину wayland, поэтому
+# они не трогаются.
 EXCLUDED_LIB_SUBSTRINGS = (
     "libglycin",
     "libgtk-3",
     "libgdk-3",
-    "libwayland-",
 )
 
 
@@ -91,17 +118,21 @@ def stem_of(filename: str) -> str:
 
 
 def wanted_plugin(path: str) -> bool:
-    """Оставить только платформенные плагины, стили и методы ввода."""
+    """Оставить только нужные плагины: платформенные, Wayland, стили и ввод."""
     normalized = path.replace("\\", "/")
     if "/plugins/" not in normalized:
         return True
-    for directory in KEPT_PLUGIN_DIRS:
-        if f"/plugins/{directory}/" in normalized:
-            if directory != "platforms":
-                return True
-            allowed = PLATFORM_PLUGINS["windows" if IS_WINDOWS else "linux"]
-            return stem_of(normalized.rsplit("/", 1)[-1]) in allowed
-    return False
+    directory, _, filename = normalized.split("/plugins/", 1)[1].partition("/")
+    if not filename:
+        return True
+    if directory == "platforms":
+        allowed = PLATFORM_PLUGINS["windows" if IS_WINDOWS else "linux"]
+        return stem_of(filename) in allowed
+    if directory in KEPT_PLUGIN_DIRS:
+        return True
+    if IS_WINDOWS:
+        return False
+    return any(item in filename for item in WAYLAND_PLUGIN_FILES.get(directory, ()))
 
 
 def wanted_binary(path: str) -> bool:
