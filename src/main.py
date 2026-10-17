@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from config_loader import load_config
 from error import ConfigError
-from ui.main_window import MainWindow
+from main_window import MainWindow
 
 CONFIG_NAME = "config.toml"
 

@@ -27,7 +27,7 @@ src/main.py          точка входа
 src/config_loader.py чтение и проверка конфигурации
 src/models.py        модели конфигурации и прогресса
 src/audio_engine.py  генерация тонов и работа с устройством вывода
-src/ui/main_window.py окно приложения
+src/main_window.py   окно приложения
 stubs/               заглушки типов для sounddevice (только для basedpyright)
 tests/               модульные тесты
 TonePlayer.spec      сборка PyInstaller
