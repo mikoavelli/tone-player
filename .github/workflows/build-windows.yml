@@ -47,16 +47,17 @@ jobs:
           enable-cache: true
           python-version: "3.14.8"
 
+      # Без dev-группы (линтеры не нужны для сборки), с группой build.
+      - name: Зависимости сборки
+        run: uv sync --no-dev --group build
+
       - name: Версии
         run: |
           uv --version
-          uv run python -V
-
-      - name: Зависимости сборки
-        run: uv sync --group build
+          uv run --no-sync python -V
 
       - name: Сборка
-        run: uv run pyinstaller --clean TonePlayer.spec
+        run: uv run --no-sync pyinstaller --clean TonePlayer.spec
 
       - name: Подготовка артефакта
         shell: pwsh
@@ -92,16 +93,16 @@ jobs:
           enable-cache: true
           python-version: "3.14.8"
 
+      # Nuitka берётся из группы build (версия закреплена в pyproject.toml), а
+      # не из зависимостей приложения: он нужен только на машине сборки.
+      - name: Зависимости сборки
+        run: uv sync --no-dev --group build
+
       - name: Версии
         run: |
           uv --version
-          uv run python -V
+          uv run --no-sync python -V
 
-      - name: Зависимости
-        run: uv sync
-
-      # Nuitka ставится сюда через --with, чтобы не тащить его в
-      # зависимости приложения: он нужен только на машине сборки.
       # На Windows patchelf не нужен, компилятор берётся из образа
       # windows-latest (Visual Studio Build Tools).
       # Версия ниже должна совпадать с version в pyproject.toml: если заданы
@@ -109,7 +110,7 @@ jobs:
       - name: Сборка
         shell: pwsh
         run: |
-          uv run --with "nuitka==4.3" python -m nuitka `
+          uv run --no-sync python -m nuitka `
             --mode=onefile `
             --windows-console-mode=disable `
             --assume-yes-for-downloads `
