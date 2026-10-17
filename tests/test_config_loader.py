@@ -68,6 +68,25 @@ class TestConfigLoader(unittest.TestCase):
         with self.assertRaises(ConfigValidationError):
             _ = load_config(self._path)
 
+    def test_rejects_frequency_above_nyquist(self) -> None:
+        self._write(VALID_CONFIG.replace("f_i = [500, 1000]", "f_i = [500, 25000]"))
+        with self.assertRaises(ConfigValidationError):
+            _ = load_config(self._path)
+
+    def test_rejects_frequency_at_nyquist(self) -> None:
+        self._write(VALID_CONFIG.replace("f_i = [500, 1000]", "f_i = [500, 24000]"))
+        with self.assertRaises(ConfigValidationError):
+            _ = load_config(self._path)
+
+    def test_accepts_high_frequency_with_higher_sample_rate(self) -> None:
+        self._write(
+            VALID_CONFIG.replace("f_i = [500, 1000]", "f_i = [500, 25000]").replace(
+                "sample_rate = 48000", "sample_rate = 96000"
+            )
+        )
+        config = load_config(self._path)
+        self.assertEqual(config.frequencies, (500.0, 25000.0))
+
     def test_rejects_positive_gain(self) -> None:
         self._write(VALID_CONFIG.replace("gain_db_i = [-12.0, -10.5]", "gain_db_i = [3.0, -10.5]"))
         with self.assertRaises(ConfigValidationError):
@@ -111,7 +130,7 @@ class TestProjectConfig(unittest.TestCase):
         self.assertEqual(config.total_seconds, 200.0)
         self.assertEqual(config.target_spl_db, 90.0)
         self.assertEqual(config.frequencies[0], 500.0)
-        self.assertEqual(config.frequencies[-1], 31500.0)
+        self.assertEqual(config.frequencies[-1], 10000.0)
 
 
 if __name__ == "__main__":

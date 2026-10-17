@@ -81,6 +81,16 @@ def load_config(config_path: Path) -> ToneConfig:
             f"[{MIN_SAMPLE_RATE}, {MAX_SAMPLE_RATE}] Гц."
         )
 
+    # Частота выше половины частоты дискретизации отображается в более низкую
+    # (алиасинг), то есть прозвучит не та частота, что указана в конфигурации.
+    nyquist = sample_rate / 2.0
+    for index, frequency in enumerate(frequencies):
+        if frequency >= nyquist:
+            raise ConfigValidationError(
+                f"Частота f_i[{index}]={frequency:g} Гц должна быть ниже половины частоты "
+                f"дискретизации ({nyquist:g} Гц); увеличьте 'sample_rate'."
+            )
+
     fade_ms = _require_float(output.get("fade_ms"), "output.fade_ms")
     if fade_ms <= 0.0:
         raise ConfigValidationError("Параметр 'fade_ms' должен быть больше нуля.")
