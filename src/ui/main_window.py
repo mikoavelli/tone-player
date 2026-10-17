@@ -7,6 +7,7 @@ from typing import Protocol, cast
 
 from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QTimer
 from PyQt6.QtGui import (
+    QCloseEvent,
     QColor,
     QFont,
     QFontDatabase,
@@ -541,6 +542,12 @@ class MainWindow(QMainWindow):
     def player(self) -> TonePlayer:
         """Проигрыватель, управляемый окном."""
         return self._player
+
+    def closeEvent(self, a0: QCloseEvent | None) -> None:
+        """При закрытии окна остановить таймер и освободить устройство вывода."""
+        self._timer.stop()
+        self._player.stop()
+        super().closeEvent(a0)
 
     # -------------------------------------------------------------------------
     # Построение интерфейса

@@ -21,7 +21,7 @@ select = ["E", "W", "F", "I", "UP", "S", "B", "N"]
 
 [tool.ruff.lint.pep8-naming]
 # CamelCase override names, required by Qt (перекрытия событий Qt).
-ignore-names = ["paintEvent", "mouseReleaseEvent", "setUp", "setUpClass"]
+ignore-names = ["paintEvent", "mouseReleaseEvent", "closeEvent", "setUp", "setUpClass"]
 
 [tool.basedpyright]
 include = ["src", "tests"]
