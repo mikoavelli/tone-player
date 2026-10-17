@@ -23,7 +23,9 @@ from pathlib import Path
 
 from PyInstaller.building.datastruct import TOC
 
-ROOT_DIR = Path(__name__).resolve().parent
+# SPECPATH — каталог spec-файла, его задаёт сам PyInstaller; сборка не зависит
+# от текущего каталога запуска.
+ROOT_DIR = Path(SPECPATH).resolve()
 SRC_DIR = ROOT_DIR / "src"
 
 IS_WINDOWS = sys.platform == "win32"
@@ -181,7 +183,9 @@ EXE_OPTIONS = {
     "debug": False,
     "bootloader_ignore_signals": False,
     "strip": not IS_WINDOWS,
-    "upx": True,
+    # UPX отключён: сжатие Qt DLL ломает их загрузку и повышает число ложных
+    # срабатываний антивирусов, а на windows-latest UPX всё равно не установлен.
+    "upx": False,
     "upx_exclude": [],
     "runtime_tmpdir": None,
     "console": False,
@@ -199,7 +203,7 @@ if ONEDIR:
         a.binaries,
         a.datas,
         strip=not IS_WINDOWS,
-        upx=True,
+        upx=False,
         upx_exclude=[],
         name="TonePlayer",
     )
