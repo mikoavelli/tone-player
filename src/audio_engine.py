@@ -364,7 +364,7 @@ class TonePlayer:
             self._state = PlayerState.PLAYING
 
     def stop(self) -> None:
-        """Остановить воспроизождение."""
+        """Остановить воспроизведение."""
         self._close_stream()
         self._generator.reset()
         self._state = PlayerState.IDLE
