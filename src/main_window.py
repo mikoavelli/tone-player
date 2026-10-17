@@ -706,7 +706,7 @@ class MainWindow(QMainWindow):
 
     def _build_autoplay_card(self) -> QFrame:
         tooltip = (
-            "Включено: переключение частоты сразу её воспроизводит.\n"
+            "Включено: во время воспроизведения новая частота звучит сразу.\n"
             "Выключено: частота переключается без звука, запуск — кнопкой «Старт»."
         )
         self.autoplay_button = ToggleSwitch()
@@ -853,11 +853,17 @@ class MainWindow(QMainWindow):
         self.autoplay_button.setAccessibleName(autoplay_text(enabled))
 
     def _navigate(self, offset: int) -> None:
-        """Сменить выбранную частоту, воспроизводя её при включённом автозапуске."""
+        """Сменить выбранную частоту.
+
+        Новая частота звучит сразу только если воспроизведение уже идёт и
+        автовоспроизведение включено. До запуска, на паузе и после завершения
+        сеанса частота лишь выбирается: запуск — кнопкой «Старт», продолжение —
+        кнопкой «Продолжить».
+        """
         index = min(max(self._player.tone_index + offset, 0), self._config.tone_count - 1)
         if index == self._player.tone_index:
             return
-        if self.autoplay_button.isChecked():
+        if self._player.state is PlayerState.PLAYING and self.autoplay_button.isChecked():
             self._start_playback(index)
             return
         self._player.select(index)
@@ -943,7 +949,11 @@ class MainWindow(QMainWindow):
             self._pause_shows_resume = is_paused
             self.pause_button.setIcon(self._icons["resume" if is_paused else "pause"])
 
-        self.status_label.setText(self._player.last_status)
+        # Пустая строка статуса скрывается: иначе она занимает высоту и отступ
+        # и оставляет пустое место под выбором устройства.
+        status = self._player.last_status
+        self.status_label.setText(status)
+        self.status_label.setVisible(bool(status))
 
         offset_db = self._player.offset_db
         gain_db = self._config.gain_at(progress.tone_index)
