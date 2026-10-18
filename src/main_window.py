@@ -158,24 +158,24 @@ QPushButton#navButton:pressed:enabled {
 QPushButton#navButton:disabled {
     background-color: transparent;
 }
-QPushButton#startButton {
+QPushButton#playButton {
     background-color: $accent;
     color: $on_accent;
     border: 1px solid $accent;
     font-size: 17px;
     font-weight: 600;
 }
-QPushButton#startButton:hover:enabled {
+QPushButton#playButton:hover:enabled {
     background-color: $accent_hover;
     border-color: $accent_hover;
 }
-QPushButton#startButton:pressed:enabled {
+QPushButton#playButton:pressed:enabled {
     background-color: $accent;
 }
-QPushButton#startButton:focus {
+QPushButton#playButton:focus {
     border: 2px solid $text;
 }
-QPushButton#startButton:disabled {
+QPushButton#playButton:disabled {
     background-color: $surface;
     color: $disabled;
     border: 1px solid $border;
@@ -277,6 +277,23 @@ def connect_toggle(signal: BoolSignal, slot: Callable[[bool], None]) -> None:
     _ = signal.connect(slot)
 
 
+# Вид главной кнопки по режиму: подпись и значок.
+PLAY_BUTTON_LOOK = {
+    "start": ("Старт", "start"),
+    "pause": ("Пауза", "pause"),
+    "resume": ("Продолжить", "start"),
+}
+
+
+def play_button_mode(state: PlayerState) -> str:
+    """Режим главной кнопки: что она сделает при нажатии в состоянии state."""
+    if state is PlayerState.PLAYING:
+        return "pause"
+    if state is PlayerState.PAUSED:
+        return "resume"
+    return "start"
+
+
 def autoplay_text(enabled: bool) -> str:
     """Подпись переключателя автовоспроизведения по его состоянию."""
     return "Автовоспроизведение: " + ("включено" if enabled else "выключено")
@@ -326,7 +343,7 @@ def _draw_glyph(kind: str, size: int, color: str) -> QPixmap:
         painter.drawPolyline(QPolygonF([QPointF(x, y) for x, y in points]))
     else:
         painter.setBrush(qcolor)
-        if kind in ("start", "resume"):
+        if kind == "start":
             # Контур того же цвета скругляет углы треугольника.
             painter.setPen(
                 QPen(
@@ -362,8 +379,7 @@ def make_icons() -> dict[str, QIcon]:
         "previous": _make_icon("previous", 22, COLOR_ICON, COLOR_ICON_DISABLED),
         "next": _make_icon("next", 22, COLOR_ICON, COLOR_ICON_DISABLED),
         "start": _make_icon("start", 18, COLOR_ON_ACCENT, COLOR_DISABLED),
-        "pause": _make_icon("pause", 18, COLOR_TEXT, COLOR_DISABLED),
-        "resume": _make_icon("resume", 18, COLOR_TEXT, COLOR_DISABLED),
+        "pause": _make_icon("pause", 18, COLOR_ON_ACCENT, COLOR_DISABLED),
         "stop": _make_icon("stop", 18, COLOR_TEXT, COLOR_DISABLED),
     }
 
@@ -506,7 +522,7 @@ class MainWindow(QMainWindow):
         self._config = config
         self._player = TonePlayer(config, stream_factory=stream_factory)
         self._finishing_handled = False
-        self._pause_shows_resume = False
+        self._play_button_mode = ""
 
         self.setWindowTitle("TonePlayer")
         self.resize(560, 680)
@@ -681,18 +697,16 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(12)
 
-        self.start_button = self._action_button("Старт", "start")
-        self.start_button.setObjectName("startButton")
-        connect_action(self.start_button.clicked, self._on_start)
-        self.pause_button = self._action_button("Пауза", "pause")
-        connect_action(self.pause_button.clicked, self._on_pause)
+        # Одна главная кнопка: «Старт», «Пауза» или «Продолжить» по состоянию.
+        self.play_button = self._action_button("Старт", "start")
+        self.play_button.setObjectName("playButton")
+        connect_action(self.play_button.clicked, self._on_play_pause)
         self.stop_button = self._action_button("Стоп", "stop")
         connect_action(self.stop_button.clicked, self._on_stop)
 
-        # Главное действие шире остальных (1,6 : 1 : 1).
-        row.addWidget(self.start_button, 8)
-        row.addWidget(self.pause_button, 5)
-        row.addWidget(self.stop_button, 5)
+        # Главное действие вдвое шире «Стопа».
+        row.addWidget(self.play_button, 2)
+        row.addWidget(self.stop_button, 1)
         return row
 
     def _action_button(self, text: str, icon_kind: str) -> QPushButton:
@@ -835,11 +849,20 @@ class MainWindow(QMainWindow):
     # Обработчики
     # -------------------------------------------------------------------------
 
-    def _on_start(self) -> None:
-        # После завершения сеанса «Старт» запускает всё заново с первой
-        # частоты, после ручного переключения — с выбранной.
-        index = 0 if self._player.state is PlayerState.FINISHED else self._player.tone_index
-        self._start_playback(index)
+    def _on_play_pause(self) -> None:
+        """Главная кнопка: запуск, пауза или продолжение — по состоянию проигрывателя."""
+        state = self._player.state
+        if state is PlayerState.PLAYING:
+            self._player.pause()
+            self._refresh()
+        elif state is PlayerState.PAUSED:
+            self._player.resume()
+            self._refresh()
+        else:
+            # После завершения сеанса запуск идёт заново с первой частоты,
+            # после ручного переключения — с выбранной.
+            index = 0 if state is PlayerState.FINISHED else self._player.tone_index
+            self._start_playback(index)
 
     def _on_previous_tone(self) -> None:
         self._navigate(-1)
@@ -878,13 +901,6 @@ class MainWindow(QMainWindow):
             _ = QMessageBox.critical(self, "Ошибка воспроизведения", str(error))
             return
         self._finishing_handled = False
-        self._refresh()
-
-    def _on_pause(self) -> None:
-        if self._player.state is PlayerState.PLAYING:
-            self._player.pause()
-        elif self._player.state is PlayerState.PAUSED:
-            self._player.resume()
         self._refresh()
 
     def _on_stop(self) -> None:
@@ -936,18 +952,17 @@ class MainWindow(QMainWindow):
         self.tone_progress.setValue(tone_percent)
         self.total_progress.setValue(total_percent)
 
-        self.start_button.setEnabled(state in (PlayerState.IDLE, PlayerState.FINISHED))
-        self.pause_button.setEnabled(state in (PlayerState.PLAYING, PlayerState.PAUSED))
         self.stop_button.setEnabled(state in (PlayerState.PLAYING, PlayerState.PAUSED))
         self.device_selector.setEnabled(state not in (PlayerState.PLAYING, PlayerState.PAUSED))
         self.previous_button.setEnabled(progress.tone_index > 0)
         self.next_button.setEnabled(progress.tone_index < self._config.tone_count - 1)
 
-        is_paused = state is PlayerState.PAUSED
-        self.pause_button.setText("Продолжить" if is_paused else "Пауза")
-        if is_paused != self._pause_shows_resume:
-            self._pause_shows_resume = is_paused
-            self.pause_button.setIcon(self._icons["resume" if is_paused else "pause"])
+        mode = play_button_mode(state)
+        if mode != self._play_button_mode:
+            self._play_button_mode = mode
+            text, icon_kind = PLAY_BUTTON_LOOK[mode]
+            self.play_button.setText(text)
+            self.play_button.setIcon(self._icons[icon_kind])
 
         # Пустая строка статуса скрывается: иначе она занимает высоту и отступ
         # и оставляет пустое место под выбором устройства.
