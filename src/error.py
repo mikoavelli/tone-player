@@ -14,5 +14,9 @@ class ConfigValidationError(ConfigError):
     """Файл конфигурации содержит некорректные данные."""
 
 
+class ConfigSaveError(ConfigError):
+    """Не удалось сохранить изменения в файл конфигурации."""
+
+
 class AudioError(Exception):
     """Не удалось начать или продолжить воспроизведение."""

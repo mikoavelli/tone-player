@@ -175,6 +175,33 @@ class TestToneGenerator(unittest.TestCase):
         self.assertFalse(generator.finished)
         self.assertGreaterEqual(generator.index, 1)
 
+    def test_set_gain_changes_amplitude(self) -> None:
+        generator = ToneGenerator(make_config())
+        generator.set_gain_at(0, -6.0)
+
+        chunk = generator.render(24000)
+
+        self.assertAlmostEqual(peak(chunk), math.pow(10.0, -0.3), delta=0.01)
+        self.assertAlmostEqual(generator.gain_at(0), -6.0)
+        self.assertAlmostEqual(generator.gain_at(1), -12.0)
+
+    def test_set_gain_does_not_touch_config(self) -> None:
+        config = make_config()
+        generator = ToneGenerator(config)
+
+        generator.set_gain_at(1, -3.0)
+
+        self.assertEqual(config.gain_db, (-12.0, -12.0))
+        self.assertEqual(generator.gain_db, (-12.0, -3.0))
+
+    def test_set_gain_rejects_bad_index(self) -> None:
+        generator = ToneGenerator(make_config())
+
+        with self.assertRaises(IndexError):
+            generator.set_gain_at(2, -3.0)
+        with self.assertRaises(IndexError):
+            generator.set_gain_at(-1, -3.0)
+
     def test_reset_returns_to_start(self) -> None:
         generator = ToneGenerator(make_config(seconds_per_tone=0.05))
         _ = generator.render(int(RATE * 0.1))
@@ -540,6 +567,28 @@ class TestTonePlayer(unittest.TestCase):
         right = stereo[1::2]
         self.assertGreater(peak(left), 0.0)
         self.assertEqual(peak(left), peak(right))
+
+    def test_gain_change_applies_to_playing_tone(self) -> None:
+        player = self._player(make_config(seconds_per_tone=1.0))
+        _ = player.start()
+        _ = fill(player, 256)
+
+        player.set_gain_at(0, -6.0)
+        buffer = fill(player, 24000)
+
+        self.assertAlmostEqual(peak(buffer), math.pow(10.0, -0.3), delta=0.01)
+        self.assertAlmostEqual(player.gain_at(0), -6.0)
+        self.assertAlmostEqual(player.current_gain_db, -6.0)
+        self.assertEqual(player.gain_db, (-6.0, -12.0))
+
+    def test_gain_survives_stop_and_restart(self) -> None:
+        player = self._player()
+        player.set_gain_at(1, -4.0)
+        _ = player.start()
+
+        player.stop()
+
+        self.assertEqual(player.gain_db, (-12.0, -4.0))
 
     def test_device_change_blocked_during_playback(self) -> None:
         player = self._player()

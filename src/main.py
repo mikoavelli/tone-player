@@ -81,7 +81,7 @@ def main() -> int:
         _ = QMessageBox.critical(None, "Ошибка конфигурации", str(error))
         return 1
 
-    window = MainWindow(config=config)
+    window = MainWindow(config=config, config_path=base_dir / CONFIG_NAME)
     window.show()
     return app.exec()
 

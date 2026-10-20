@@ -1,15 +1,17 @@
 """Загрузка и проверка конфигурационного файла."""
 
+import math
+import os
+import re
+import tempfile
 import tomllib
+from contextlib import suppress
 from pathlib import Path
 from typing import cast
 
-from error import ConfigNotFoundError, ConfigValidationError
+from calibration import MAX_GAIN_DB, MIN_GAIN_DB
+from error import ConfigNotFoundError, ConfigSaveError, ConfigValidationError
 from models import ToneConfig
-
-# Границы для калибровочного ослабления, дБ.
-MIN_GAIN_DB = -96.0
-MAX_GAIN_DB = 0.0
 
 # Допустимый диапазон частоты дискретизации, Гц.
 MIN_SAMPLE_RATE = 8000
@@ -152,3 +154,104 @@ def _require_float_list(value: object, name: str) -> tuple[float, ...]:
         raise ConfigValidationError(f"Параметр '{name}' должен быть непустым списком чисел.")
     items = cast("list[object]", value)
     return tuple(_require_float(item, f"{name}[{index}]") for index, item in enumerate(items))
+
+
+# -----------------------------------------------------------------------------
+# Сохранение калибровки
+# -----------------------------------------------------------------------------
+
+_SECTION_HEADER = re.compile(
+    r"^[ \t]*\[(?P<name>[^\[\]\r\n]+)\][ \t]*(?:#.*)?\r?$", re.MULTILINE
+)
+_GAIN_BLOCK = re.compile(r"^(?P<head>[ \t]*gain_db_i[ \t]*=[ \t]*)\[[^\]]*\]", re.MULTILINE)
+
+# Значений в строке блока gain_db_i и отступ строк: как в поставляемом config.toml.
+_GAINS_PER_ROW = 5
+_ROW_INDENT = "    "
+
+
+def _format_gain_block(gains: tuple[float, ...], newline: str) -> str:
+    """Список gain_db_i в стиле поставляемого config.toml."""
+    values = [repr(float(gain)) for gain in gains]
+    if len(values) <= _GAINS_PER_ROW:
+        return "[" + ", ".join(values) + "]"
+    rows = [
+        _ROW_INDENT + ", ".join(values[start : start + _GAINS_PER_ROW])
+        for start in range(0, len(values), _GAINS_PER_ROW)
+    ]
+    return "[" + newline + ("," + newline).join(rows) + newline + "]"
+
+
+def _replace_gain_block(text: str, gains: tuple[float, ...]) -> str:
+    """Заменить в тексте конфигурации только значение gain_db_i в секции [calibration]."""
+    section_start = -1
+    section_end = len(text)
+    for header in _SECTION_HEADER.finditer(text):
+        if section_start >= 0:
+            section_end = header.start()
+            break
+        if header.group("name").strip() == "calibration":
+            section_start = header.end()
+    if section_start < 0:
+        raise ConfigSaveError("В конфигурационном файле нет секции [calibration].")
+
+    block = _GAIN_BLOCK.search(text, section_start, section_end)
+    if block is None:
+        raise ConfigSaveError("В секции [calibration] не найден список gain_db_i.")
+
+    newline = "\r\n" if "\r\n" in text else "\n"
+    replacement = block.group("head") + _format_gain_block(gains, newline)
+    return text[: block.start()] + replacement + text[block.end() :]
+
+
+def save_gain_db(config_path: Path, gain_db: tuple[float, ...]) -> None:
+    """Записать калибровку в config.toml, не трогая остальной текст и комментарии.
+
+    Заменяется только список gain_db_i в секции [calibration]. Результат
+    перед записью разбирается заново и сверяется с переданными значениями,
+    файл записывается атомарно (временный файл рядом и замена).
+    """
+    for index, gain in enumerate(gain_db):
+        if not math.isfinite(gain) or not MIN_GAIN_DB <= gain <= MAX_GAIN_DB:
+            raise ConfigSaveError(
+                f"Значение gain_db_i[{index}]={gain} дБ вне диапазона "
+                f"[{MIN_GAIN_DB}, {MAX_GAIN_DB}] дБ, файл не изменён."
+            )
+
+    try:
+        original = config_path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as err:
+        raise ConfigSaveError(f"Не удалось прочитать конфигурационный файл: {err}") from err
+
+    updated = _replace_gain_block(original, gain_db)
+
+    try:
+        parsed: object = tomllib.loads(updated)
+        root = _require_dict(parsed, "root")
+        calibration = _require_dict(root.get("calibration"), "calibration")
+        saved = _require_float_list(calibration.get("gain_db_i"), "calibration.gain_db_i")
+    except (tomllib.TOMLDecodeError, ConfigValidationError) as err:
+        raise ConfigSaveError(
+            f"Калибровка не записана: результат не прошёл проверку ({err})."
+        ) from err
+    if saved != tuple(float(gain) for gain in gain_db):
+        raise ConfigSaveError(
+            "Калибровка не записана: результат не совпал с введёнными значениями."
+        )
+
+    if updated == original:
+        return
+
+    temp_name = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            "wb", dir=config_path.parent, prefix=config_path.name + ".", suffix=".tmp", delete=False
+        ) as temp_file:
+            temp_name = temp_file.name
+            _ = temp_file.write(updated.encode("utf-8"))
+        os.replace(temp_name, config_path)
+    except OSError as err:
+        if temp_name:
+            with suppress(OSError):
+                os.unlink(temp_name)
+        raise ConfigSaveError(f"Не удалось записать конфигурационный файл: {err}") from err

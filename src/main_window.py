@@ -2,10 +2,11 @@
 
 import math
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from string import Template
 from typing import Protocol, cast
 
-from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QTimer
+from PyQt6.QtCore import QLocale, QPointF, QRectF, QSize, Qt, QTimer
 from PyQt6.QtGui import (
     QCloseEvent,
     QColor,
@@ -21,7 +22,9 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QAbstractButton,
+    QAbstractSpinBox,
     QComboBox,
+    QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -36,13 +39,20 @@ from PyQt6.QtWidgets import (
 )
 
 from audio_engine import DEFAULT_DEVICE_LABEL, StreamFactory, TonePlayer, list_output_devices
-from error import AudioError
+from calibration import CalibrationResult, apply_measurement
+from config_loader import save_gain_db
+from error import AudioError, ConfigError
 from models import PlayerState, ToneConfig
 
 MIN_OFFSET_DB = -12.0
 MAX_OFFSET_DB = 12.0
 LEVEL_STEP_DB = 0.5
 REFRESH_INTERVAL_MS = 50
+
+# Диапазон и шаг поля «Измерено» (звуковое давление звукомера), дБ.
+MIN_MEASURED_DB = 0.0
+MAX_MEASURED_DB = 200.0
+MEASURED_STEP_DB = 0.1
 
 # -----------------------------------------------------------------------------
 # Оформление
@@ -206,6 +216,22 @@ QSlider::handle:horizontal:hover {
     background-color: $accent_hover;
 }
 
+QDoubleSpinBox {
+    background-color: $surface;
+    border: 1px solid $border;
+    border-radius: 10px;
+    padding: 0 12px;
+    font-size: 15px;
+    selection-background-color: $border_hover;
+    selection-color: $text;
+}
+QDoubleSpinBox:hover:enabled {
+    border-color: $border_hover;
+}
+QDoubleSpinBox:focus {
+    border-color: $accent;
+}
+
 QComboBox {
     background-color: $surface;
     border: 1px solid $border;
@@ -265,6 +291,10 @@ class BoolSignal(Protocol):
     def connect(self, slot: Callable[[bool], None], /) -> object: ...
 
 
+class FloatSignal(Protocol):
+    def connect(self, slot: Callable[[float], None], /) -> object: ...
+
+
 def connect_action(signal: VoidSignal, slot: Callable[[], None]) -> None:
     _ = signal.connect(slot)
 
@@ -274,6 +304,10 @@ def connect_index(signal: IntSignal, slot: Callable[[int], None]) -> None:
 
 
 def connect_toggle(signal: BoolSignal, slot: Callable[[bool], None]) -> None:
+    _ = signal.connect(slot)
+
+
+def connect_value(signal: FloatSignal, slot: Callable[[float], None]) -> None:
     _ = signal.connect(slot)
 
 
@@ -517,15 +551,21 @@ class MainWindow(QMainWindow):
         self,
         config: ToneConfig,
         stream_factory: StreamFactory | None = None,
+        config_path: Path | None = None,
     ) -> None:
         super().__init__()
         self._config = config
+        # Файл, в который записывается калибровка; None — только в памяти.
+        self._config_path = config_path
         self._player = TonePlayer(config, stream_factory=stream_factory)
         self._finishing_handled = False
         self._play_button_mode = ""
+        # Введённые, но ещё не применённые показания звукомера по номерам тонов.
+        self._measured: dict[int, float] = {}
+        self._calibration_tone = -1
 
         self.setWindowTitle("TonePlayer")
-        self.resize(560, 680)
+        self.resize(560, 800)
 
         self._sans_family = pick_font_family(
             _SANS_FAMILIES,
@@ -587,6 +627,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(self._build_transport())
         layout.addWidget(self._build_autoplay_card())
         layout.addLayout(self._build_level())
+        layout.addWidget(self._build_calibration_card())
         # Лишняя высота окна уходит сюда: выбор устройства и статус остаются внизу.
         layout.addStretch(1)
         layout.addLayout(self._build_device())
@@ -798,6 +839,75 @@ class MainWindow(QMainWindow):
         block.addLayout(stats)
         return block
 
+    def _build_calibration_card(self) -> QFrame:
+        """Карточка калибровки: показание звукомера пересчитывается в gain_db_i тона."""
+        tooltip = (
+            "Введите давление, которое показал звукомер для звучащей частоты, и нажмите\n"
+            "«Применить»: калибровка тона сдвинется на разность «цель − измерено»\n"
+            "и будет записана в config.toml."
+        )
+        card = QFrame()
+        card.setObjectName("card")
+        card.setToolTip(tooltip)
+        box = QVBoxLayout(card)
+        box.setContentsMargins(16, 12, 16, 12)
+        box.setSpacing(10)
+
+        header = QHBoxLayout()
+        self.calibration_title = QLabel("Калибровка")
+        self.calibration_title.setObjectName("titleLabel")
+        self.calibration_gain_label = QLabel()
+        self.calibration_gain_label.setFont(self._mono_font(17, QFont.Weight.DemiBold))
+        header.addWidget(self.calibration_title)
+        header.addStretch(1)
+        header.addWidget(self.calibration_gain_label)
+        box.addLayout(header)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        caption = QLabel("Измерено звукомером")
+        caption.setObjectName("captionLabel")
+
+        self.measured_spin = QDoubleSpinBox()
+        # Десятичная точка, как в остальных значениях окна, независимо от локали системы.
+        self.measured_spin.setLocale(
+            QLocale(QLocale.Language.English, QLocale.Country.UnitedStates)
+        )
+        self.measured_spin.setRange(MIN_MEASURED_DB, MAX_MEASURED_DB)
+        self.measured_spin.setDecimals(1)
+        self.measured_spin.setSingleStep(MEASURED_STEP_DB)
+        self.measured_spin.setSuffix(" дБ")
+        self.measured_spin.setValue(self._config.target_spl_db)
+        self.measured_spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.measured_spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        # Значение фиксируется по Enter или уходу из поля; колесо мыши работает
+        # только в поле с фокусом, чтобы показание не менялось случайно.
+        self.measured_spin.setKeyboardTracking(False)
+        self.measured_spin.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.measured_spin.setFont(self._mono_font(16))
+        self.measured_spin.setFixedSize(130, 44)
+        self.measured_spin.setAccessibleName("Измерено звукомером, дБ")
+        connect_value(self.measured_spin.valueChanged, self._on_measured_changed)
+
+        self.apply_button = QPushButton("Применить")
+        self.apply_button.setFixedHeight(44)
+        self.apply_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.apply_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.apply_button.setToolTip(tooltip)
+        connect_action(self.apply_button.clicked, self._on_apply_calibration)
+
+        row.addWidget(caption, 1)
+        row.addWidget(self.measured_spin)
+        row.addWidget(self.apply_button)
+        box.addLayout(row)
+
+        self.calibration_note = QLabel()
+        self.calibration_note.setObjectName("statusLabel")
+        self.calibration_note.setWordWrap(True)
+        self.calibration_note.setVisible(False)
+        box.addWidget(self.calibration_note)
+        return card
+
     def _scale_label(self, value_db: float) -> QLabel:
         label = QLabel(format_scale(value_db))
         label.setObjectName("scaleLabel")
@@ -903,6 +1013,46 @@ class MainWindow(QMainWindow):
         self._finishing_handled = False
         self._refresh()
 
+    def _on_measured_changed(self, value: float) -> None:
+        self._measured[self._calibration_tone] = value
+
+    def _on_apply_calibration(self) -> None:
+        """Пересчитать калибровку текущего тона по показанию звукомера и сохранить её."""
+        # Кнопка не забирает фокус, поэтому набранный текст фиксируется явно.
+        self.measured_spin.interpretText()
+        index = self._player.tone_index
+        result = apply_measurement(
+            gain_db=self._player.gain_at(index),
+            offset_db=self._player.offset_db,
+            measured_db=self.measured_spin.value(),
+            target_db=self._config.target_spl_db,
+        )
+        self._player.set_gain_at(index, result.new_gain_db)
+        _ = self._measured.pop(index, None)
+        self._show_measured(index)
+
+        message = calibration_message(result)
+        if self._config_path is not None:
+            try:
+                save_gain_db(self._config_path, self._player.gain_db)
+            except ConfigError as error:
+                message += f" Не сохранено: {error}"
+            else:
+                message += f" Записано в {self._config_path.name}."
+        self._set_calibration_note(message)
+        self._refresh()
+
+    def _show_measured(self, index: int) -> None:
+        """Показать в поле введённое для тона показание или целевое давление."""
+        value = self._measured.get(index, self._config.target_spl_db)
+        _ = self.measured_spin.blockSignals(True)
+        self.measured_spin.setValue(value)
+        _ = self.measured_spin.blockSignals(False)
+
+    def _set_calibration_note(self, text: str) -> None:
+        self.calibration_note.setText(text)
+        self.calibration_note.setVisible(bool(text))
+
     def _on_stop(self) -> None:
         self._player.stop()
         self._finishing_handled = False
@@ -938,6 +1088,13 @@ class MainWindow(QMainWindow):
             self._frequency_html(format_frequency_value(self._player.current_frequency))
         )
 
+        # Показание и сообщение калибровки относятся к конкретному тону: при смене
+        # тона поле показывает его собственное значение, а прежнее сообщение уходит.
+        if progress.tone_index != self._calibration_tone:
+            self._calibration_tone = progress.tone_index
+            self._show_measured(progress.tone_index)
+            self._set_calibration_note("")
+
         self.tone_label.setText(f"Тон {progress.tone_index + 1} из {self._config.tone_count}")
         self.tone_ticks.set_state(self._config.tone_count, progress.tone_index)
 
@@ -971,7 +1128,11 @@ class MainWindow(QMainWindow):
         self.status_label.setVisible(bool(status))
 
         offset_db = self._player.offset_db
-        gain_db = self._config.gain_at(progress.tone_index)
+        gain_db = self._player.gain_at(progress.tone_index)
+        self.calibration_title.setText(
+            "Калибровка · " + format_frequency(self._player.current_frequency)
+        )
+        self.calibration_gain_label.setText(format_db(gain_db))
         self.level_label.setText(format_db(offset_db))
         self.tone_gain_label.setText(format_db(gain_db))
         self.total_gain_label.setText(format_db(gain_db + offset_db))
@@ -997,6 +1158,22 @@ def format_db(value: float, *, signed: bool = True) -> str:
     """Уровень в дБ; вместо дефиса — настоящий минус."""
     text = f"{value:+.1f}" if signed else f"{value:.0f}"
     return text.replace("-", "−") + " дБ"
+
+
+def calibration_message(result: CalibrationResult) -> str:
+    """Что произошло после применения показания звукомера."""
+    if result.changed:
+        text = f"Калибровка: {format_db(result.old_gain_db)} → {format_db(result.new_gain_db)}."
+    else:
+        text = "Калибровка не изменилась."
+    if result.shortfall_db > 0:
+        text += (
+            f" Сигнал на полной шкале, а давления не хватает: поднимите усиление колонок"
+            f" примерно на {result.shortfall_db:.1f} дБ и измерьте снова."
+        )
+    elif result.clamped_low:
+        text += " Достигнут нижний предел диапазона: снизьте усиление колонок."
+    return text
 
 
 def format_scale(value_db: float) -> str:

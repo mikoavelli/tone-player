@@ -84,6 +84,10 @@ class ToneGenerator:
         self._config = config
         self._autoplay_enabled = autoplay_enabled
         self._offset_db = config.default_offset_db
+        # Калибровка правится из интерфейса, поэтому живёт здесь, а не в
+        # неизменяемом ToneConfig. Замена элемента списка атомарна, и поток
+        # PortAudio читает значение один раз на блок.
+        self._gain_db = list(config.gain_db)
         self.index = 0
         self.frames_in_tone = 0
         self.finished = False
@@ -109,9 +113,24 @@ class ToneGenerator:
         return max(int(round(self._config.seconds_per_tone * self._config.sample_rate)), 1)
 
     @property
+    def gain_db(self) -> tuple[float, ...]:
+        """Калибровочное ослабление всех тонов, дБ (с учётом правок из интерфейса)."""
+        return tuple(self._gain_db)
+
+    def gain_at(self, index: int) -> float:
+        """Калибровочное ослабление тона по индексу, дБ."""
+        return self._gain_db[index]
+
+    def set_gain_at(self, index: int, gain_db: float) -> None:
+        """Изменить калибровочное ослабление тона, дБ."""
+        if not 0 <= index < len(self._gain_db):
+            raise IndexError(f"Нет тона с номером {index}.")
+        self._gain_db[index] = gain_db
+
+    @property
     def current_gain_db(self) -> float:
-        """Калибровочное ослабление текущего тона, дБ."""
-        return self._config.gain_at(self.index) + self._offset_db
+        """Итоговое ослабление текущего тона: калибровка плюс ползунок, дБ."""
+        return self.gain_at(self.index) + self._offset_db
 
     @property
     def amplitude(self) -> float:
@@ -279,6 +298,19 @@ class TonePlayer:
     def current_gain_db(self) -> float:
         """Итоговое ослабление текущего тона с учётом ползунка, дБ."""
         return self._generator.current_gain_db
+
+    @property
+    def gain_db(self) -> tuple[float, ...]:
+        """Калибровочное ослабление всех тонов, дБ."""
+        return self._generator.gain_db
+
+    def gain_at(self, index: int) -> float:
+        """Калибровочное ослабление тона по индексу, дБ."""
+        return self._generator.gain_at(index)
+
+    def set_gain_at(self, index: int, gain_db: float) -> None:
+        """Изменить калибровочное ослабление тона; звучащий тон меняется сразу."""
+        self._generator.set_gain_at(index, gain_db)
 
     @property
     def device_name(self) -> str:
