@@ -8,11 +8,9 @@ from types import TracebackType
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
-from config_loader import load_config
-from error import ConfigError
+from error import SettingsError, SettingsNotFoundError
 from main_window import MainWindow
-
-CONFIG_NAME = "config.toml"
+from settings_store import SETTINGS_NAME, load_settings_at_startup
 
 
 def handle_unhandled_exception(
@@ -35,8 +33,8 @@ def handle_unhandled_exception(
     _ = dialog.exec()
 
 
-def config_candidates() -> list[Path]:
-    """Каталоги, где может лежать config.toml, в порядке приоритета.
+def settings_candidates() -> list[Path]:
+    """Каталоги, где может лежать settings.json, в порядке приоритета.
 
     Порядок зависит от упаковщика: у PyInstaller один файл — это
     sys.executable, у Nuitka onefile — argv[0], при запуске из исходников —
@@ -54,10 +52,10 @@ def config_candidates() -> list[Path]:
 
 
 def get_base_dir() -> Path:
-    """Каталог с конфигурацией: первый, где реально лежит config.toml."""
-    candidates = config_candidates()
+    """Каталог с настройками: первый, где реально лежит settings.json."""
+    candidates = settings_candidates()
     for candidate in candidates:
-        if (candidate / CONFIG_NAME).is_file():
+        if (candidate / SETTINGS_NAME).is_file():
             return candidate
     return candidates[0]
 
@@ -66,7 +64,7 @@ def main() -> int:
     base_dir = get_base_dir()
     os.chdir(base_dir)
 
-    # QApplication создаётся до чтения конфигурации: сообщение об ошибке
+    # QApplication создаётся до чтения настроек: сообщение об ошибке
     # показывается через QMessageBox, а любой виджет требует готового
     # приложения.
     app = QApplication(sys.argv)
@@ -75,13 +73,21 @@ def main() -> int:
 
     sys.excepthook = handle_unhandled_exception
 
+    settings_path = base_dir / SETTINGS_NAME
     try:
-        config = load_config(base_dir / CONFIG_NAME)
-    except ConfigError as error:
-        _ = QMessageBox.critical(None, "Ошибка конфигурации", str(error))
+        settings = load_settings_at_startup(settings_path)
+    except SettingsNotFoundError as error:
+        _ = QMessageBox.critical(
+            None,
+            "Нет файла настроек",
+            f"{error}\n\nПоложите {SETTINGS_NAME} рядом с программой: без него она не запускается.",
+        )
+        return 1
+    except SettingsError as error:
+        _ = QMessageBox.critical(None, "Ошибка настроек", str(error))
         return 1
 
-    window = MainWindow(config=config, config_path=base_dir / CONFIG_NAME)
+    window = MainWindow(settings=settings, settings_path=settings_path)
     window.show()
     return app.exec()
 

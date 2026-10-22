@@ -1,17 +1,24 @@
 import math
 import unittest
 from array import array
+from collections.abc import Sequence
+from unittest import mock
 
 from tests.bootstrap import (
     AudioBlock,
     AudioError,
+    OutputDevice,
     PlayerState,
+    StreamFactory,
     ToneConfig,
     ToneGenerator,
     TonePlayer,
+    find_device,
+    list_output_devices,
 )
 
 RATE = 48000
+MASTER = -12.0
 
 
 class FakeStream:
@@ -53,20 +60,40 @@ class OutputBuffer:
 
 def make_config(
     frequencies: tuple[float, ...] = (500.0, 1000.0),
-    gain_db: tuple[float, ...] = (-12.0, -12.0),
     seconds_per_tone: float = 1.0,
     fade_ms: float = 20.0,
-    default_offset_db: float = 0.0,
 ) -> ToneConfig:
     return ToneConfig(
         frequencies=frequencies,
-        gain_db=gain_db,
         seconds_per_tone=seconds_per_tone,
-        target_spl_db=90.0,
         sample_rate=RATE,
         fade_ms=fade_ms,
-        device=None,
-        default_offset_db=default_offset_db,
+    )
+
+
+def make_generator(
+    config: ToneConfig | None = None,
+    levels: Sequence[float] | None = None,
+    master_db: float = MASTER,
+) -> ToneGenerator:
+    config = config or make_config()
+    return ToneGenerator(config, levels or (0.0,) * config.tone_count, master_db)
+
+
+def make_player(
+    config: ToneConfig | None = None,
+    levels: Sequence[float] | None = None,
+    master_db: float = MASTER,
+    device: int | None = None,
+    stream_factory: StreamFactory | None = FakeStream,
+) -> TonePlayer:
+    config = config or make_config()
+    return TonePlayer(
+        config,
+        levels or (0.0,) * config.tone_count,
+        master_db,
+        device=device,
+        stream_factory=stream_factory,
     )
 
 
@@ -94,39 +121,43 @@ def count_positive_crossings(chunk: AudioBlock) -> int:
 
 
 class TestToneGenerator(unittest.TestCase):
-    def test_amplitude_follows_calibration(self) -> None:
-        generator = ToneGenerator(make_config())
+    def test_level_is_master_plus_band_correction(self) -> None:
+        generator = make_generator(levels=(6.0, -4.0))
 
         chunk = generator.render(24000)
 
-        self.assertAlmostEqual(peak(chunk), math.pow(10.0, -0.6), delta=0.01)
-        self.assertAlmostEqual(generator.current_gain_db, -12.0)
+        self.assertAlmostEqual(peak(chunk), math.pow(10.0, -0.3), delta=0.01)
+        self.assertAlmostEqual(generator.current_gain_db, -6.0)
+        generator.seek(1)
+        self.assertAlmostEqual(generator.current_gain_db, -16.0)
 
-    def test_offset_changes_amplitude(self) -> None:
-        generator = ToneGenerator(make_config())
+    def test_master_change_changes_amplitude(self) -> None:
+        generator = make_generator()
         _ = generator.render(256)
-        generator.set_offset_db(-6.0)
+        generator.set_master_db(-18.0)
 
         chunk = generator.render(24000)
 
         self.assertAlmostEqual(peak(chunk), math.pow(10.0, -0.9), delta=0.01)
+        self.assertAlmostEqual(generator.master_db, -18.0)
 
     def test_amplitude_is_clipped_to_full_scale(self) -> None:
-        generator = ToneGenerator(make_config(gain_db=(0.0, 0.0), default_offset_db=12.0))
+        generator = make_generator(levels=(10.0, 10.0), master_db=0.0)
 
         chunk = generator.render(24000)
 
         self.assertLessEqual(peak(chunk), 1.0)
+        self.assertAlmostEqual(peak(chunk), 1.0, delta=0.001)
 
     def test_generated_frequency(self) -> None:
-        generator = ToneGenerator(make_config(frequencies=(1000.0,), gain_db=(0.0,)))
+        generator = make_generator(make_config(frequencies=(1000.0,)), master_db=0.0)
 
         chunk = generator.render(RATE)
 
         self.assertEqual(count_positive_crossings(chunk), 1000)
 
     def test_fade_in_and_out(self) -> None:
-        generator = ToneGenerator(make_config(frequencies=(1000.0,), gain_db=(0.0,)))
+        generator = make_generator(make_config(frequencies=(1000.0,)), master_db=0.0)
 
         chunk = generator.render(RATE)
 
@@ -138,7 +169,7 @@ class TestToneGenerator(unittest.TestCase):
         self.assertGreater(middle, 0.9)
 
     def test_tone_advances_after_duration(self) -> None:
-        generator = ToneGenerator(make_config(seconds_per_tone=0.1))
+        generator = make_generator(make_config(seconds_per_tone=0.1))
 
         _ = generator.render(int(RATE * 0.1) - 1)
         self.assertEqual(generator.index, 0)
@@ -148,7 +179,7 @@ class TestToneGenerator(unittest.TestCase):
         self.assertEqual(generator.config.frequency_at(generator.index), 1000.0)
 
     def test_finished_after_last_tone(self) -> None:
-        generator = ToneGenerator(make_config(seconds_per_tone=0.05))
+        generator = make_generator(make_config(seconds_per_tone=0.05))
 
         chunk = generator.render(int(RATE * 0.1))
 
@@ -157,7 +188,7 @@ class TestToneGenerator(unittest.TestCase):
         self.assertEqual(generator.index, 2)
 
     def test_autoplay_enabled_by_default(self) -> None:
-        generator = ToneGenerator(make_config(seconds_per_tone=0.05))
+        generator = make_generator(make_config(seconds_per_tone=0.05))
 
         generator.set_autoplay(True)
         _ = generator.render(int(RATE * 0.1))
@@ -175,35 +206,62 @@ class TestToneGenerator(unittest.TestCase):
         self.assertFalse(generator.finished)
         self.assertGreaterEqual(generator.index, 1)
 
-    def test_set_gain_changes_amplitude(self) -> None:
-        generator = ToneGenerator(make_config())
-        generator.set_gain_at(0, -6.0)
+    def test_set_level_changes_amplitude(self) -> None:
+        generator = make_generator()
+        generator.set_level_at(0, 6.0)
 
         chunk = generator.render(24000)
 
         self.assertAlmostEqual(peak(chunk), math.pow(10.0, -0.3), delta=0.01)
-        self.assertAlmostEqual(generator.gain_at(0), -6.0)
-        self.assertAlmostEqual(generator.gain_at(1), -12.0)
+        self.assertAlmostEqual(generator.level_at(0), 6.0)
+        self.assertAlmostEqual(generator.level_at(1), 0.0)
+        self.assertEqual(generator.levels, (6.0, 0.0))
 
-    def test_set_gain_does_not_touch_config(self) -> None:
-        config = make_config()
-        generator = ToneGenerator(config)
+    def test_levels_are_copied(self) -> None:
+        levels = [1.0, 2.0]
+        generator = make_generator(levels=levels)
 
-        generator.set_gain_at(1, -3.0)
+        levels[0] = -5.0
+        generator.set_level_at(1, 3.0)
 
-        self.assertEqual(config.gain_db, (-12.0, -12.0))
-        self.assertEqual(generator.gain_db, (-12.0, -3.0))
+        self.assertEqual(generator.levels, (1.0, 3.0))
+        self.assertEqual(levels, [-5.0, 2.0])
 
-    def test_set_gain_rejects_bad_index(self) -> None:
-        generator = ToneGenerator(make_config())
+    def test_set_level_rejects_bad_index(self) -> None:
+        generator = make_generator()
 
         with self.assertRaises(IndexError):
-            generator.set_gain_at(2, -3.0)
+            generator.set_level_at(2, 1.0)
         with self.assertRaises(IndexError):
-            generator.set_gain_at(-1, -3.0)
+            generator.set_level_at(-1, 1.0)
+
+    def test_set_level_rejects_out_of_range(self) -> None:
+        generator = make_generator()
+
+        for value in (10.5, -10.5, float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                generator.set_level_at(0, value)
+        self.assertEqual(generator.levels, (0.0, 0.0))
+
+    def test_master_is_limited_to_full_scale(self) -> None:
+        generator = make_generator()
+
+        for value in (0.5, -60.5, float("nan")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                generator.set_master_db(value)
+        generator.set_master_db(0.0)
+        generator.set_master_db(-60.0)
+
+    def test_constructor_rejects_wrong_level_count(self) -> None:
+        with self.assertRaises(ValueError):
+            _ = ToneGenerator(make_config(), (0.0,), MASTER)
+
+    def test_constructor_rejects_out_of_range_level(self) -> None:
+        with self.assertRaises(ValueError):
+            _ = ToneGenerator(make_config(), (0.0, 11.0), MASTER)
 
     def test_reset_returns_to_start(self) -> None:
-        generator = ToneGenerator(make_config(seconds_per_tone=0.05))
+        generator = make_generator(make_config(seconds_per_tone=0.05))
         _ = generator.render(int(RATE * 0.1))
 
         generator.reset()
@@ -213,7 +271,7 @@ class TestToneGenerator(unittest.TestCase):
         self.assertFalse(generator.finished)
 
     def test_seek_moves_to_tone(self) -> None:
-        generator = ToneGenerator(make_config())
+        generator = make_generator(make_config())
 
         generator.seek(1)
 
@@ -222,7 +280,7 @@ class TestToneGenerator(unittest.TestCase):
         self.assertFalse(generator.finished)
 
     def test_seek_after_finish_clears_finished(self) -> None:
-        generator = ToneGenerator(make_config(seconds_per_tone=0.05))
+        generator = make_generator(make_config(seconds_per_tone=0.05))
         _ = generator.render(int(RATE * 0.1))
         self.assertTrue(generator.finished)
 
@@ -234,7 +292,7 @@ class TestToneGenerator(unittest.TestCase):
 
 class TestTonePlayer(unittest.TestCase):
     def _player(self, config: ToneConfig | None = None) -> TonePlayer:
-        return TonePlayer(config or make_config(), stream_factory=FakeStream)
+        return make_player(config)
 
     def test_idle_outputs_silence(self) -> None:
         player = self._player()
@@ -274,7 +332,7 @@ class TestTonePlayer(unittest.TestCase):
             streams.append(stream)
             return stream
 
-        player = TonePlayer(make_config(), stream_factory=factory)
+        player = make_player(make_config(), stream_factory=factory)
         _ = player.start()
 
         self.assertEqual(len(streams), 1)
@@ -286,21 +344,22 @@ class TestTonePlayer(unittest.TestCase):
         def factory(**kwargs: object) -> FakeStream:
             raise OSError("устройство занято")
 
-        player = TonePlayer(make_config(), stream_factory=factory)
+        player = make_player(make_config(), stream_factory=factory)
 
         with self.assertRaises(AudioError):
             _ = player.start()
         self.assertEqual(player.state, PlayerState.IDLE)
 
-    def test_offset_changes_amplitude_live(self) -> None:
-        player = self._player(make_config(gain_db=(-6.0, -6.0)))
+    def test_master_change_applies_live(self) -> None:
+        player = make_player(master_db=-6.0)
         _ = player.start()
-        player.set_offset_db(-6.0)
+        player.set_master_db(-12.0)
 
         buffer = fill(player, 24000)
 
         self.assertAlmostEqual(peak(buffer), math.pow(10.0, -0.6), delta=0.01)
         self.assertAlmostEqual(player.current_gain_db, -12.0)
+        self.assertAlmostEqual(player.master_db, -12.0)
 
     def test_session_finishes_after_last_tone(self) -> None:
         player = self._player(make_config(seconds_per_tone=0.05))
@@ -367,7 +426,7 @@ class TestTonePlayer(unittest.TestCase):
             streams.append(stream)
             return stream
 
-        player = TonePlayer(make_config(seconds_per_tone=1.0), stream_factory=factory)
+        player = make_player(make_config(seconds_per_tone=1.0), stream_factory=factory)
         _ = player.start()
         _ = fill(player, 256)
 
@@ -390,7 +449,7 @@ class TestTonePlayer(unittest.TestCase):
             streams.append(stream)
             return stream
 
-        player = TonePlayer(make_config(seconds_per_tone=1.0), stream_factory=factory)
+        player = make_player(make_config(seconds_per_tone=1.0), stream_factory=factory)
         _ = player.start()
         _ = fill(player, 256)
         player.pause()
@@ -439,7 +498,7 @@ class TestTonePlayer(unittest.TestCase):
             streams.append(stream)
             return stream
 
-        player = TonePlayer(make_config(), stream_factory=factory)
+        player = make_player(make_config(), stream_factory=factory)
         _ = player.start()
 
         player.select(1)
@@ -517,7 +576,7 @@ class TestTonePlayer(unittest.TestCase):
                 raise OSError("нет моно")
             return FakeStream(**kwargs)
 
-        player = TonePlayer(make_config(), stream_factory=factory)
+        player = make_player(make_config(), stream_factory=factory)
         _ = player.start()
 
         self.assertEqual(len(attempts), 2)
@@ -533,17 +592,7 @@ class TestTonePlayer(unittest.TestCase):
                 raise OSError("устройство недоступно")
             return FakeStream(**kwargs)
 
-        config = ToneConfig(
-            frequencies=(500.0, 1000.0),
-            gain_db=(-12.0, -12.0),
-            seconds_per_tone=1.0,
-            target_spl_db=90.0,
-            sample_rate=RATE,
-            fade_ms=20.0,
-            device=3,
-            default_offset_db=0.0,
-        )
-        player = TonePlayer(config, stream_factory=factory)
+        player = make_player(device=3, stream_factory=factory)
         _ = player.start()
 
         self.assertIn("запасной вариант", player.last_status)
@@ -557,7 +606,7 @@ class TestTonePlayer(unittest.TestCase):
                 raise OSError("нет моно")
             return FakeStream(**kwargs)
 
-        player = TonePlayer(make_config(), stream_factory=factory)
+        player = make_player(make_config(), stream_factory=factory)
         _ = player.start()
         buffer = OutputBuffer(4 * 512 * 2)
         player.fill_buffer(buffer)
@@ -568,27 +617,122 @@ class TestTonePlayer(unittest.TestCase):
         self.assertGreater(peak(left), 0.0)
         self.assertEqual(peak(left), peak(right))
 
-    def test_gain_change_applies_to_playing_tone(self) -> None:
+    def test_level_change_applies_to_playing_tone(self) -> None:
         player = self._player(make_config(seconds_per_tone=1.0))
         _ = player.start()
         _ = fill(player, 256)
 
-        player.set_gain_at(0, -6.0)
+        player.set_level_at(0, 6.0)
         buffer = fill(player, 24000)
 
         self.assertAlmostEqual(peak(buffer), math.pow(10.0, -0.3), delta=0.01)
-        self.assertAlmostEqual(player.gain_at(0), -6.0)
+        self.assertAlmostEqual(player.level_at(0), 6.0)
         self.assertAlmostEqual(player.current_gain_db, -6.0)
-        self.assertEqual(player.gain_db, (-6.0, -12.0))
+        self.assertEqual(player.levels, (6.0, 0.0))
 
-    def test_gain_survives_stop_and_restart(self) -> None:
+    def test_levels_survive_stop_and_restart(self) -> None:
         player = self._player()
-        player.set_gain_at(1, -4.0)
+        player.set_level_at(1, -4.0)
         _ = player.start()
 
         player.stop()
 
-        self.assertEqual(player.gain_db, (-12.0, -4.0))
+        self.assertEqual(player.levels, (0.0, -4.0))
+
+    def test_selected_band_level_is_used_when_idle(self) -> None:
+        player = make_player(levels=(0.0, -4.0))
+
+        player.select(1)
+
+        self.assertAlmostEqual(player.current_gain_db, -16.0)
+
+    def test_reconfigure_replaces_bands(self) -> None:
+        player = make_player(make_config(seconds_per_tone=0.05))
+        new_config = make_config(frequencies=(250.0, 750.0, 1250.0), seconds_per_tone=2.0)
+
+        player.reconfigure(new_config, (1.0, 2.0, 3.0))
+
+        self.assertEqual(player.config, new_config)
+        self.assertEqual(player.levels, (1.0, 2.0, 3.0))
+        self.assertEqual(player.current_frequency, 250.0)
+        self.assertAlmostEqual(player.progress().total_remaining, 6.0)
+        self.assertEqual(player.state, PlayerState.IDLE)
+
+    def test_reconfigure_keeps_selected_band_when_possible(self) -> None:
+        player = make_player(make_config(frequencies=(500.0, 1000.0, 1500.0)))
+        player.select(1)
+
+        player.reconfigure(make_config(frequencies=(500.0, 900.0, 1500.0, 2000.0)), (0.0,) * 4)
+
+        self.assertEqual(player.tone_index, 1)
+        self.assertEqual(player.current_frequency, 900.0)
+
+    def test_reconfigure_clamps_selected_band(self) -> None:
+        player = make_player(make_config(frequencies=(500.0, 1000.0, 1500.0)))
+        player.select(2)
+
+        player.reconfigure(make_config(frequencies=(500.0, 1000.0)), (0.0, 0.0))
+
+        self.assertEqual(player.tone_index, 1)
+        self.assertEqual(player.current_frequency, 1000.0)
+
+    def test_reconfigure_keeps_master_and_autoplay(self) -> None:
+        player = make_player(master_db=-20.0)
+        player.set_autoplay(False)
+
+        player.reconfigure(make_config(seconds_per_tone=0.05), (0.0, 0.0))
+        _ = player.start()
+        _ = fill(player, int(RATE * 0.05))
+
+        self.assertAlmostEqual(player.master_db, -20.0)
+        self.assertEqual(player.state, PlayerState.FINISHED)
+        self.assertEqual(player.progress().tone_index, 0)
+
+    def test_reconfigure_after_finish_returns_to_idle(self) -> None:
+        player = self._player(make_config(seconds_per_tone=0.05))
+        _ = player.start()
+        _ = fill(player, int(RATE * 0.1))
+        self.assertEqual(player.state, PlayerState.FINISHED)
+
+        player.reconfigure(make_config(), (0.0, 0.0))
+
+        self.assertEqual(player.state, PlayerState.IDLE)
+
+    def test_reconfigure_blocked_during_playback_and_pause(self) -> None:
+        player = self._player()
+        _ = player.start()
+
+        with self.assertRaises(AudioError):
+            player.reconfigure(make_config(), (0.0, 0.0))
+        player.pause()
+        with self.assertRaises(AudioError):
+            player.reconfigure(make_config(), (0.0, 0.0))
+        self.assertEqual(player.levels, (0.0, 0.0))
+
+    def test_reconfigure_rejects_wrong_level_count(self) -> None:
+        player = self._player()
+
+        with self.assertRaises(ValueError):
+            player.reconfigure(make_config(), (0.0,))
+        self.assertEqual(player.levels, (0.0, 0.0))
+
+    def test_reconfigured_player_opens_stream_with_new_rate(self) -> None:
+        streams: list[FakeStream] = []
+
+        def factory(**kwargs: object) -> FakeStream:
+            stream = FakeStream(**kwargs)
+            streams.append(stream)
+            return stream
+
+        player = make_player(stream_factory=factory)
+        config = ToneConfig(
+            frequencies=(500.0,), seconds_per_tone=1.0, sample_rate=96000, fade_ms=20.0
+        )
+
+        player.reconfigure(config, (0.0,))
+        _ = player.start()
+
+        self.assertEqual(streams[0].kwargs["samplerate"], 96000)
 
     def test_device_change_blocked_during_playback(self) -> None:
         player = self._player()
@@ -603,6 +747,73 @@ class TestTonePlayer(unittest.TestCase):
         player.set_device(1)
 
         self.assertEqual(player.device, 1)
+
+
+class TestDevices(unittest.TestCase):
+    ENTRIES = [
+        {"name": "Microphone", "max_output_channels": 0, "hostapi": 0},
+        {"name": "Speakers", "max_output_channels": 2, "hostapi": 0},
+        {"name": "Speakers", "max_output_channels": 2, "hostapi": 1},
+        {"name": "", "max_output_channels": 2, "hostapi": 7},
+    ]
+    HOST_APIS = ({"name": "MME"}, {"name": "Windows WASAPI"})
+
+    def _devices(self) -> list[OutputDevice]:
+        with (
+            mock.patch("audio_engine.sd.query_devices", create=True, return_value=self.ENTRIES),
+            mock.patch("audio_engine.sd.query_hostapis", create=True, return_value=self.HOST_APIS),
+        ):
+            return list_output_devices()
+
+    def test_only_output_devices_are_listed(self) -> None:
+        devices = self._devices()
+
+        self.assertEqual([device.index for device in devices], [1, 2, 3])
+
+    def test_label_includes_host_api(self) -> None:
+        devices = self._devices()
+
+        self.assertEqual(devices[0].label, "Speakers [MME]")
+        self.assertEqual(devices[1].label, "Speakers [Windows WASAPI]")
+
+    def test_same_name_on_different_host_apis_is_distinguishable(self) -> None:
+        labels = [device.label for device in self._devices()]
+
+        self.assertEqual(len(set(labels)), len(labels))
+
+    def test_unknown_host_api_and_blank_name(self) -> None:
+        device = self._devices()[2]
+
+        self.assertEqual(device.name, "Устройство 3")
+        self.assertEqual(device.label, "Устройство 3")
+
+    def test_find_device_by_label(self) -> None:
+        devices = self._devices()
+
+        found = find_device(devices, "Speakers [Windows WASAPI]")
+
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found.index, 2)
+
+    def test_find_device_missing_or_default(self) -> None:
+        devices = self._devices()
+
+        self.assertIsNone(find_device(devices, "Нет такого [MME]"))
+        self.assertIsNone(find_device(devices, None))
+
+    def test_query_failure_gives_empty_list(self) -> None:
+        with mock.patch("audio_engine.sd.query_devices", create=True, side_effect=OSError("нет")):
+            self.assertEqual(list_output_devices(), [])
+
+    def test_host_api_failure_keeps_devices_without_interface(self) -> None:
+        with (
+            mock.patch("audio_engine.sd.query_devices", create=True, return_value=self.ENTRIES),
+            mock.patch("audio_engine.sd.query_hostapis", create=True, side_effect=OSError("нет")),
+        ):
+            devices = list_output_devices()
+
+        self.assertEqual(devices[0].label, "Speakers")
 
 
 if __name__ == "__main__":

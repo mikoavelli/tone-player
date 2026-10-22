@@ -7,13 +7,22 @@
 
 import math
 from array import array
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Protocol, cast
 
 import sounddevice as sd
 
 from error import AudioError
-from models import PlaybackProgress, PlayerState, ToneConfig
+from models import (
+    LEVEL_MAX_DB,
+    LEVEL_MIN_DB,
+    MASTER_MAX_DB,
+    MASTER_MIN_DB,
+    PlaybackProgress,
+    PlayerState,
+    ToneConfig,
+)
 
 _CHANNELS = 1
 _FALLBACK_CHANNELS = 2
@@ -60,34 +69,96 @@ PORTAUDIO_ERRORS: tuple[type[Exception], ...] = (
 )
 
 
-def list_output_devices() -> list[tuple[int, str]]:
-    """Список устройств вывода PortAudio: индекс и название."""
-    devices: list[tuple[int, str]] = []
+@dataclass(frozen=True)
+class OutputDevice:
+    """Устройство вывода PortAudio.
+
+    Индекс меняется между запусками, поэтому в настройках хранится метка:
+    название и звуковой интерфейс (одно устройство видно через MME, WASAPI и
+    другие интерфейсы под одним названием).
+    """
+
+    index: int
+    name: str
+    host_api: str
+
+    @property
+    def label(self) -> str:
+        """Устойчивое между запусками обозначение устройства."""
+        return f"{self.name} [{self.host_api}]" if self.host_api else self.name
+
+
+def list_output_devices() -> list[OutputDevice]:
+    """Список устройств вывода PortAudio."""
+    devices: list[OutputDevice] = []
     try:
         entries = sd.query_devices()
     except PORTAUDIO_ERRORS:
         return devices
 
+    host_apis = _host_api_names()
     for index, entry in enumerate(entries):
         channels: object = entry.get("max_output_channels")
         if not isinstance(channels, int) or channels <= 0:
             continue
         name = entry.get("name")
-        devices.append((index, str(name) if name else f"Устройство {index}"))
+        host_api: object = entry.get("hostapi")
+        devices.append(
+            OutputDevice(
+                index=index,
+                name=str(name) if name else f"Устройство {index}",
+                host_api=host_apis.get(host_api, "") if isinstance(host_api, int) else "",
+            )
+        )
     return devices
 
 
-class ToneGenerator:
-    """Формирование сигнала тона: частота, калибровка уровня, плавные переходы."""
+def find_device(devices: Sequence[OutputDevice], label: str | None) -> OutputDevice | None:
+    """Устройство с меткой label; None, если метка не задана или устройства нет."""
+    if label is None:
+        return None
+    for device in devices:
+        if device.label == label:
+            return device
+    return None
 
-    def __init__(self, config: ToneConfig, *, autoplay_enabled: bool = True) -> None:
+
+def _host_api_names() -> dict[int, str]:
+    try:
+        entries = sd.query_hostapis()
+    except PORTAUDIO_ERRORS:
+        return {}
+    names: dict[int, str] = {}
+    for index, entry in enumerate(entries):
+        name: object = entry.get("name")
+        if name:
+            names[index] = str(name)
+    return names
+
+
+class ToneGenerator:
+    """Формирование сигнала тона: частота, уровень полосы, плавные переходы.
+
+    Уровень тона в дБ от полной шкалы — это общий уровень плюс поправка полосы.
+    """
+
+    def __init__(
+        self,
+        config: ToneConfig,
+        levels: Sequence[float],
+        master_db: float,
+        *,
+        autoplay_enabled: bool = True,
+    ) -> None:
+        if len(levels) != config.tone_count:
+            raise ValueError("Число уровней должно совпадать с числом частот.")
         self._config = config
         self._autoplay_enabled = autoplay_enabled
-        self._offset_db = config.default_offset_db
-        # Калибровка правится из интерфейса, поэтому живёт здесь, а не в
-        # неизменяемом ToneConfig. Замена элемента списка атомарна, и поток
-        # PortAudio читает значение один раз на блок.
-        self._gain_db = list(config.gain_db)
+        self._master_db = _checked_master(master_db)
+        # Уровни правятся из интерфейса во время звучания, поэтому живут здесь,
+        # а не в неизменяемом ToneConfig. Замена элемента списка атомарна, и
+        # поток PortAudio читает значение один раз на блок.
+        self._levels = [_checked_level(level) for level in levels]
         self.index = 0
         self.frames_in_tone = 0
         self.finished = False
@@ -103,9 +174,9 @@ class ToneGenerator:
         return self._config
 
     @property
-    def offset_db(self) -> float:
-        """Положение ползунка уровня, дБ."""
-        return self._offset_db
+    def master_db(self) -> float:
+        """Общий уровень, дБ от полной шкалы."""
+        return self._master_db
 
     @property
     def tone_length_frames(self) -> int:
@@ -113,24 +184,24 @@ class ToneGenerator:
         return max(int(round(self._config.seconds_per_tone * self._config.sample_rate)), 1)
 
     @property
-    def gain_db(self) -> tuple[float, ...]:
-        """Калибровочное ослабление всех тонов, дБ (с учётом правок из интерфейса)."""
-        return tuple(self._gain_db)
+    def levels(self) -> tuple[float, ...]:
+        """Поправки уровня всех полос, дБ."""
+        return tuple(self._levels)
 
-    def gain_at(self, index: int) -> float:
-        """Калибровочное ослабление тона по индексу, дБ."""
-        return self._gain_db[index]
+    def level_at(self, index: int) -> float:
+        """Поправка уровня полосы по индексу, дБ."""
+        return self._levels[index]
 
-    def set_gain_at(self, index: int, gain_db: float) -> None:
-        """Изменить калибровочное ослабление тона, дБ."""
-        if not 0 <= index < len(self._gain_db):
-            raise IndexError(f"Нет тона с номером {index}.")
-        self._gain_db[index] = gain_db
+    def set_level_at(self, index: int, level_db: float) -> None:
+        """Изменить поправку уровня полосы, дБ; звучащий тон меняется сразу."""
+        if not 0 <= index < len(self._levels):
+            raise IndexError(f"Нет полосы с номером {index}.")
+        self._levels[index] = _checked_level(level_db)
 
     @property
     def current_gain_db(self) -> float:
-        """Итоговое ослабление текущего тона: калибровка плюс ползунок, дБ."""
-        return self.gain_at(self.index) + self._offset_db
+        """Итоговый уровень текущего тона: общий уровень плюс поправка полосы, дБ."""
+        return self._master_db + self.level_at(min(self.index, len(self._levels) - 1))
 
     @property
     def amplitude(self) -> float:
@@ -159,9 +230,9 @@ class ToneGenerator:
     # Управление
     # -------------------------------------------------------------------------
 
-    def set_offset_db(self, offset_db: float) -> None:
-        """Изменить уровень сигнала относительно калибровки, дБ."""
-        self._offset_db = offset_db
+    def set_master_db(self, master_db: float) -> None:
+        """Изменить общий уровень, дБ от полной шкалы."""
+        self._master_db = _checked_master(master_db)
 
     def reset(self) -> None:
         """Вернуться к началу последовательности."""
@@ -239,6 +310,22 @@ class ToneGenerator:
             self.finished = True
 
 
+def _checked_level(level_db: float) -> float:
+    if not LEVEL_MIN_DB <= level_db <= LEVEL_MAX_DB:  # NaN тоже не проходит
+        raise ValueError(
+            f"Поправка полосы {level_db} дБ вне диапазона [{LEVEL_MIN_DB}, {LEVEL_MAX_DB}] дБ."
+        )
+    return float(level_db)
+
+
+def _checked_master(master_db: float) -> float:
+    if not MASTER_MIN_DB <= master_db <= MASTER_MAX_DB:
+        raise ValueError(
+            f"Общий уровень {master_db} дБ вне диапазона [{MASTER_MIN_DB}, {MASTER_MAX_DB}] дБ."
+        )
+    return float(master_db)
+
+
 class TonePlayer:
     """Воспроизведение последовательности тонов с заданными частотами.
 
@@ -249,13 +336,16 @@ class TonePlayer:
     def __init__(
         self,
         config: ToneConfig,
+        levels: Sequence[float],
+        master_db: float,
+        device: int | None = None,
         stream_factory: StreamFactory | None = None,
     ) -> None:
         self._config = config
         self._stream_factory = sd.RawOutputStream if stream_factory is None else stream_factory
-        self._generator = ToneGenerator(config)
+        self._generator = ToneGenerator(config, levels, master_db)
         self._state = PlayerState.IDLE
-        self._device: int | str | None = config.device
+        self._device: int | None = device
         self._channels = _CHANNELS
         self._stream: AudioStream | None = None
         self._last_status = ""
@@ -280,9 +370,9 @@ class TonePlayer:
         return self._state
 
     @property
-    def offset_db(self) -> float:
-        """Положение ползунка уровня, дБ."""
-        return self._generator.offset_db
+    def master_db(self) -> float:
+        """Общий уровень, дБ от полной шкалы."""
+        return self._generator.master_db
 
     @property
     def tone_index(self) -> int:
@@ -296,21 +386,45 @@ class TonePlayer:
 
     @property
     def current_gain_db(self) -> float:
-        """Итоговое ослабление текущего тона с учётом ползунка, дБ."""
+        """Итоговый уровень выбранного тона: общий уровень плюс поправка полосы, дБ."""
         return self._generator.current_gain_db
 
     @property
-    def gain_db(self) -> tuple[float, ...]:
-        """Калибровочное ослабление всех тонов, дБ."""
-        return self._generator.gain_db
+    def levels(self) -> tuple[float, ...]:
+        """Поправки уровня всех полос, дБ."""
+        return self._generator.levels
 
-    def gain_at(self, index: int) -> float:
-        """Калибровочное ослабление тона по индексу, дБ."""
-        return self._generator.gain_at(index)
+    def level_at(self, index: int) -> float:
+        """Поправка уровня полосы по индексу, дБ."""
+        return self._generator.level_at(index)
 
-    def set_gain_at(self, index: int, gain_db: float) -> None:
-        """Изменить калибровочное ослабление тона; звучащий тон меняется сразу."""
-        self._generator.set_gain_at(index, gain_db)
+    def set_level_at(self, index: int, level_db: float) -> None:
+        """Изменить поправку уровня полосы; звучащий тон меняется сразу."""
+        self._generator.set_level_at(index, level_db)
+
+    def set_master_db(self, master_db: float) -> None:
+        """Изменить общий уровень, дБ от полной шкалы."""
+        self._generator.set_master_db(master_db)
+
+    def reconfigure(self, config: ToneConfig, levels: Sequence[float]) -> None:
+        """Заменить набор частот, длительности и уровни; только когда звука нет.
+
+        Выбранная полоса сохраняется, если она ещё есть в новом наборе, иначе
+        выбирается последняя. Общий уровень и автовоспроизведение не меняются.
+        """
+        if self._state in (PlayerState.PLAYING, PlayerState.PAUSED):
+            raise AudioError("Параметры нельзя менять во время воспроизведения.")
+        generator = ToneGenerator(
+            config,
+            levels,
+            self._generator.master_db,
+            autoplay_enabled=self._generator.advance_allowed(),
+        )
+        self._close_stream()
+        generator.seek(self.tone_index)
+        self._config = config
+        self._generator = generator
+        self._state = PlayerState.IDLE
 
     @property
     def device_name(self) -> str:
@@ -318,11 +432,11 @@ class TonePlayer:
         return self._resolve_device_name()
 
     @property
-    def device(self) -> int | str | None:
-        """Устройство вывода: индекс или часть названия; None — по умолчанию."""
+    def device(self) -> int | None:
+        """Индекс устройства вывода; None — устройство по умолчанию."""
         return self._device
 
-    def set_device(self, device: int | str | None) -> None:
+    def set_device(self, device: int | None) -> None:
         """Выбрать устройство вывода для следующего запуска."""
         if self._state in (PlayerState.PLAYING, PlayerState.PAUSED):
             raise AudioError("Устройство вывода нельзя сменить во время воспроизведения.")
@@ -405,10 +519,6 @@ class TonePlayer:
         """Освободить устройство вывода, сохранив итоговое состояние сеанса."""
         self._close_stream()
 
-    def set_offset_db(self, offset_db: float) -> None:
-        """Изменить уровень сигнала относительно калибровки, дБ."""
-        self._generator.set_offset_db(offset_db)
-
     def progress(self) -> PlaybackProgress:
         """Текущее положение воспроизведения.
 
@@ -479,7 +589,7 @@ class TonePlayer:
 
     def _open_stream(self) -> tuple[AudioStream, int]:
         """Открыть поток вывода, подбирая число каналов и устройство по умолчанию."""
-        attempts: list[tuple[int | str | None, int]] = [
+        attempts: list[tuple[int | None, int]] = [
             (self._device, _CHANNELS),
             (self._device, _FALLBACK_CHANNELS),
         ]

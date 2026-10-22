@@ -65,7 +65,7 @@ jobs:
           $out = "out/PyInstaller"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Copy-Item "dist/TonePlayer.exe" $out
-          Copy-Item "config.toml" $out
+          Copy-Item "settings.json" $out
           $exe = Get-Item "$out/TonePlayer.exe"
           "Размер: {0:N1} МБ" -f ($exe.Length / 1MB) | Write-Host
           if ($exe.Length -lt 5MB) {
@@ -156,7 +156,7 @@ jobs:
           $out = "out/Nuitka"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Copy-Item "dist-nuitka/TonePlayer.exe" $out
-          Copy-Item "config.toml" $out
+          Copy-Item "settings.json" $out
           $exe = Get-Item "$out/TonePlayer.exe"
           "Размер: {0:N1} МБ" -f ($exe.Length / 1MB) | Write-Host
           if ($exe.Length -lt 5MB) {
