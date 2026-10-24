@@ -23,41 +23,40 @@ from error import (
     SettingsVersionError,
 )
 from models import (
-    LEVEL_MAX_DB,
-    LEVEL_MIN_DB,
-    LEVEL_STEP_DB,
-    MASTER_MAX_DB,
-    MASTER_MIN_DB,
+    DEFAULT_LEVEL_SCALE,
+    MASTER_GAIN_SCALE,
     MAX_BANDS,
     MAX_FADE_MS,
+    MAX_LEVEL_SCALE_DB,
+    MAX_LEVEL_STEP_DB,
     MAX_PRESET_NAME_LENGTH,
     MAX_SAMPLE_RATE,
     MAX_SECONDS_PER_TONE,
     MIN_FADE_MS,
     MIN_FREQUENCY_HZ,
+    MIN_LEVEL_SCALE_DB,
+    MIN_LEVEL_STEP_DB,
     MIN_SAMPLE_RATE,
     MIN_SECONDS_PER_TONE,
     Band,
+    LevelScale,
     Preset,
     Settings,
     nyquist_hz,
-    on_level_step,
 )
 
 SETTINGS_NAME = "settings.json"
 SCHEMA_VERSION = 1
+DEFAULT_DEVICE_TOKEN = "default"  # noqa: S105
 
 _ROOT_KEYS = frozenset(
-    {"schema_version", "playback", "output", "bands", "presets", "active_preset"}
+    {"schema_version", "playback", "output", "levels", "bands", "presets", "active_preset"}
 )
-_PLAYBACK_KEYS = frozenset({"seconds_per_tone", "sample_rate", "fade_ms"})
-_OUTPUT_KEYS = frozenset({"device", "master_level_db"})
+_PLAYBACK_KEYS = frozenset({"seconds_per_tone", "sample_rate", "fade_ms", "autoplay"})
+_OUTPUT_KEYS = frozenset({"device", "master_gain_db"})
+_LEVELS_KEYS = frozenset({"min_db", "max_db", "step_db"})
 _BAND_KEYS = frozenset({"frequency_hz", "level_db"})
-_PRESET_KEYS = frozenset({"name", "device", "bands"})
-
-# Частоты пресета не привязаны к текущей частоте дискретизации, поэтому для них
-# проверяется самая широкая допустимая; Найквист проверяется при применении.
-_PRESET_MAX_FREQUENCY_HZ = nyquist_hz(MAX_SAMPLE_RATE)
+_PRESET_KEYS = frozenset({"name", "device", "levels"})
 
 
 # -----------------------------------------------------------------------------
@@ -78,7 +77,42 @@ def preset_name_problem(name: str) -> str | None:
     return None
 
 
-def validate_bands(bands: Sequence[Band], *, max_frequency_hz: float, what: str) -> None:
+def validate_level_scale(scale: LevelScale) -> None:
+    """Проверить диапазон и шаг ползунков уровня."""
+    values = (scale.min_db, scale.max_db, scale.step_db)
+    if not all(math.isfinite(value) for value in values):
+        raise SettingsFormatError("Диапазон и шаг ползунков должны быть конечными числами.")
+    if not MIN_LEVEL_SCALE_DB <= scale.min_db < 0.0:
+        raise SettingsFormatError(
+            f"Нижняя граница ползунков должна быть от {MIN_LEVEL_SCALE_DB:g} до 0 дБ."
+        )
+    if not 0.0 < scale.max_db <= MAX_LEVEL_SCALE_DB:
+        raise SettingsFormatError(
+            f"Верхняя граница ползунков должна быть от 0 до {MAX_LEVEL_SCALE_DB:g} дБ."
+        )
+    if not MIN_LEVEL_STEP_DB <= scale.step_db <= MAX_LEVEL_STEP_DB:
+        raise SettingsFormatError(
+            f"Шаг ползунков должен быть от {MIN_LEVEL_STEP_DB:g} до {MAX_LEVEL_STEP_DB:g} дБ."
+        )
+    steps = scale.span_db / scale.step_db
+    if abs(steps - round(steps)) > 1e-9:
+        raise SettingsFormatError(
+            f"Диапазон ползунков {scale.span_db:g} дБ должен делиться на шаг "
+            f"{scale.step_db:g} дБ без остатка."
+        )
+    if not scale.on_step(scale.min_db):
+        raise SettingsFormatError(
+            f"Нижняя граница ползунков должна быть кратна шагу {scale.step_db:g} дБ."
+        )
+
+
+def validate_bands(
+    bands: Sequence[Band],
+    *,
+    max_frequency_hz: float,
+    what: str,
+    scale: LevelScale = DEFAULT_LEVEL_SCALE,
+) -> None:
     """Проверить набор полос: число, частоты (по возрастанию) и уровни."""
     if not 1 <= len(bands) <= MAX_BANDS:
         raise SettingsFormatError(f"{what}: число полос должно быть от 1 до {MAX_BANDS}.")
@@ -98,17 +132,18 @@ def validate_bands(bands: Sequence[Band], *, max_frequency_hz: float, what: str)
             )
         previous = frequency
 
-        level = band.level_db
-        if not math.isfinite(level) or not LEVEL_MIN_DB <= level <= LEVEL_MAX_DB:
-            raise SettingsFormatError(
-                f"{what}: уровень полосы {number} ({level:g} дБ) должен быть "
-                f"от {LEVEL_MIN_DB:g} до {LEVEL_MAX_DB:g} дБ."
-            )
-        if not on_level_step(level):
-            raise SettingsFormatError(
-                f"{what}: уровень полосы {number} ({level:g} дБ) должен быть кратен "
-                f"{LEVEL_STEP_DB:g} дБ."
-            )
+        _validate_level(band.level_db, scale, f"{what}: уровень полосы {number}")
+
+
+def _validate_level(level_db: float, scale: LevelScale, what: str) -> None:
+    if not math.isfinite(level_db) or not scale.min_db <= level_db <= scale.max_db:
+        raise SettingsFormatError(
+            f"{what} ({level_db:g} дБ) должен быть от {scale.min_db:g} до {scale.max_db:g} дБ."
+        )
+    if not scale.on_step(level_db):
+        raise SettingsFormatError(
+            f"{what} ({level_db:g} дБ) должен быть кратен {scale.step_db:g} дБ."
+        )
 
 
 def _validate_device(device: str | None, what: str) -> None:
@@ -116,12 +151,19 @@ def _validate_device(device: str | None, what: str) -> None:
         raise SettingsFormatError(f"{what}: название устройства не может быть пустым.")
 
 
+def _validate_bool(value: object, what: str) -> None:
+    if not isinstance(value, bool):
+        raise SettingsFormatError(f"{what}: ожидалось true или false.")
+
+
 def validate_settings(settings: Settings) -> None:
     """Проверить настройки целиком; при нарушении бросает SettingsFormatError."""
+    scale = settings.level_scale
+    validate_level_scale(scale)
+
     if not MIN_SECONDS_PER_TONE <= settings.seconds_per_tone <= MAX_SECONDS_PER_TONE:
         raise SettingsFormatError(
-            f"Время на тон должно быть от {MIN_SECONDS_PER_TONE:g} до "
-            f"{MAX_SECONDS_PER_TONE:g} с."
+            f"Время на тон должно быть от {MIN_SECONDS_PER_TONE:g} до {MAX_SECONDS_PER_TONE:g} с."
         )
     if not MIN_SAMPLE_RATE <= settings.sample_rate <= MAX_SAMPLE_RATE:
         raise SettingsFormatError(
@@ -131,16 +173,24 @@ def validate_settings(settings: Settings) -> None:
         raise SettingsFormatError(
             f"Длительность нарастания должна быть от {MIN_FADE_MS:g} до {MAX_FADE_MS:g} мс."
         )
-    if not MASTER_MIN_DB <= settings.master_level_db <= MASTER_MAX_DB:
+    if not MASTER_GAIN_SCALE.min_db <= settings.master_gain_db <= MASTER_GAIN_SCALE.max_db:
         raise SettingsFormatError(
-            f"Общий уровень должен быть от {MASTER_MIN_DB:g} до {MASTER_MAX_DB:g} дБ."
+            f"Уровень мастера должен быть от {MASTER_GAIN_SCALE.min_db:g} до "
+            f"{MASTER_GAIN_SCALE.max_db:g} дБ."
         )
-    if not on_level_step(settings.master_level_db):
-        raise SettingsFormatError(f"Общий уровень должен быть кратен {LEVEL_STEP_DB:g} дБ.")
+    if not MASTER_GAIN_SCALE.on_step(settings.master_gain_db):
+        raise SettingsFormatError(
+            f"Уровень мастера должен быть кратен {MASTER_GAIN_SCALE.step_db:g} дБ."
+        )
+    autoplay: object = settings.autoplay
+    _validate_bool(autoplay, "Автовоспроизведение")
     _validate_device(settings.device, "Устройство вывода")
 
     validate_bands(
-        settings.bands, max_frequency_hz=nyquist_hz(settings.sample_rate), what="Полосы"
+        settings.bands,
+        max_frequency_hz=nyquist_hz(settings.sample_rate),
+        what="Полосы",
+        scale=scale,
     )
 
     names: set[str] = set()
@@ -153,11 +203,12 @@ def validate_settings(settings: Settings) -> None:
             raise SettingsFormatError(f"Пресет '{preset.name}' встречается дважды.")
         names.add(key)
         _validate_device(preset.device, f"Пресет '{preset.name}'")
-        validate_bands(
-            preset.bands,
-            max_frequency_hz=_PRESET_MAX_FREQUENCY_HZ,
-            what=f"Пресет '{preset.name}'",
-        )
+        if not 1 <= len(preset.levels) <= MAX_BANDS:
+            raise SettingsFormatError(
+                f"Пресет '{preset.name}': число уровней должно быть от 1 до {MAX_BANDS}."
+            )
+        for number, level in enumerate(preset.levels, start=1):
+            _validate_level(level, scale, f"Пресет '{preset.name}': уровень {number}")
 
     if settings.active_preset is not None and settings.active_preset.casefold() not in names:
         raise SettingsFormatError(
@@ -205,12 +256,42 @@ def _as_int(value: object, what: str) -> int:
     return value
 
 
-def _as_optional_text(value: object, what: str) -> str | None:
-    if value is None:
+def _as_bool(value: object, what: str) -> bool:
+    if not isinstance(value, bool):
+        raise SettingsFormatError(f"{what}: ожидалось true или false.")
+    return value
+
+
+def _as_device(value: object, what: str) -> str | None:
+    """Устройство: строка названия или default для устройства по умолчанию."""
+    if value == DEFAULT_DEVICE_TOKEN:
         return None
     if not isinstance(value, str):
-        raise SettingsFormatError(f"{what}: ожидалась строка или null.")
+        raise SettingsFormatError(
+            f'{what}: ожидалась строка с названием устройства или "{DEFAULT_DEVICE_TOKEN}".'
+        )
     return value
+
+
+def _as_active_preset(value: object, what: str) -> str | None:
+    """Активный пресет: имя пресета или default для отсутствующего."""
+    if value == DEFAULT_DEVICE_TOKEN:
+        return None
+    if not isinstance(value, str) or not value:
+        raise SettingsFormatError(
+            f'{what}: ожидалась строка с именем пресета или "{DEFAULT_DEVICE_TOKEN}".'
+        )
+    return value
+
+
+def _active_preset_data(active_preset: str | None) -> str:
+    """Представление отсутствующего активного пресета в файле настроек."""
+    return DEFAULT_DEVICE_TOKEN if active_preset is None else active_preset
+
+
+def _device_data(device: str | None) -> str:
+    """Представление устройства по умолчанию в файле настроек."""
+    return DEFAULT_DEVICE_TOKEN if device is None else device
 
 
 def _as_text(value: object, what: str) -> str:
@@ -240,22 +321,32 @@ def _parse_bands(value: object, what: str) -> tuple[Band, ...]:
     return tuple(bands)
 
 
+def _parse_levels(value: object, what: str) -> tuple[float, ...]:
+    levels: list[float] = []
+    for number, item in enumerate(_as_list(value, what), start=1):
+        levels.append(_as_number(item, f"{what}[{number}]"))
+    return tuple(levels)
+
+
 def parse_settings(raw: object) -> Settings:
     """Построить и проверить настройки по разобранному JSON."""
     root = _as_object(raw, "Файл")
     version = root.get("schema_version")
-    if isinstance(version, int) and not isinstance(version, bool) and version != SCHEMA_VERSION:
-        raise SettingsVersionError(
-            f"Файл настроек имеет версию схемы {version}, программа поддерживает "
-            f"версию {SCHEMA_VERSION}."
-        )
+    if isinstance(version, int) and not isinstance(version, bool):
+        if version != SCHEMA_VERSION:
+            raise SettingsVersionError(
+                f"Файл настроек имеет версию схемы {version}, программа поддерживает "
+                f"версию {SCHEMA_VERSION}."
+            )
     _exact_keys(root, _ROOT_KEYS, "Файл")
-    _ = _as_int(version, "schema_version")
+    _ = _as_int(root["schema_version"], "schema_version")
 
     playback = _as_object(root["playback"], "playback")
     _exact_keys(playback, _PLAYBACK_KEYS, "playback")
     output = _as_object(root["output"], "output")
     _exact_keys(output, _OUTPUT_KEYS, "output")
+    levels = _as_object(root["levels"], "levels")
+    _exact_keys(levels, _LEVELS_KEYS, "levels")
 
     presets: list[Preset] = []
     for number, item in enumerate(_as_list(root["presets"], "presets"), start=1):
@@ -265,8 +356,8 @@ def parse_settings(raw: object) -> Settings:
         presets.append(
             Preset(
                 name=_as_text(data["name"], f"{label}.name"),
-                device=_as_optional_text(data["device"], f"{label}.device"),
-                bands=_parse_bands(data["bands"], f"{label}.bands"),
+                device=_as_device(data["device"], f"{label}.device"),
+                levels=_parse_levels(data["levels"], f"{label}.levels"),
             )
         )
 
@@ -274,11 +365,17 @@ def parse_settings(raw: object) -> Settings:
         seconds_per_tone=_as_number(playback["seconds_per_tone"], "playback.seconds_per_tone"),
         sample_rate=_as_int(playback["sample_rate"], "playback.sample_rate"),
         fade_ms=_as_number(playback["fade_ms"], "playback.fade_ms"),
-        master_level_db=_as_number(output["master_level_db"], "output.master_level_db"),
-        device=_as_optional_text(output["device"], "output.device"),
+        master_gain_db=_as_number(output["master_gain_db"], "output.master_gain_db"),
+        device=_as_device(output["device"], "output.device"),
         bands=_parse_bands(root["bands"], "bands"),
         presets=tuple(presets),
-        active_preset=_as_optional_text(root["active_preset"], "active_preset"),
+        active_preset=_as_active_preset(root["active_preset"], "active_preset"),
+        level_scale=LevelScale(
+            min_db=_as_number(levels["min_db"], "levels.min_db"),
+            max_db=_as_number(levels["max_db"], "levels.max_db"),
+            step_db=_as_number(levels["step_db"], "levels.step_db"),
+        ),
+        autoplay=_as_bool(playback["autoplay"], "playback.autoplay"),
     )
     validate_settings(settings)
     return settings
@@ -300,7 +397,7 @@ def load_settings(path: Path) -> Settings:
         raise SettingsFormatError(f"Файл настроек не в кодировке UTF-8: {err}") from err
 
     try:
-        raw: object = json.loads(text)
+        raw = cast("object", json.loads(text))
     except (json.JSONDecodeError, RecursionError) as err:
         raise SettingsFormatError(f"Синтаксическая ошибка JSON: {err}") from err
 
@@ -324,17 +421,27 @@ def settings_to_data(settings: Settings) -> dict[str, object]:
             "seconds_per_tone": settings.seconds_per_tone,
             "sample_rate": settings.sample_rate,
             "fade_ms": settings.fade_ms,
+            "autoplay": settings.autoplay,
         },
         "output": {
-            "device": settings.device,
-            "master_level_db": settings.master_level_db,
+            "device": _device_data(settings.device),
+            "master_gain_db": settings.master_gain_db,
+        },
+        "levels": {
+            "min_db": settings.level_scale.min_db,
+            "max_db": settings.level_scale.max_db,
+            "step_db": settings.level_scale.step_db,
         },
         "bands": bands_data(settings.bands),
         "presets": [
-            {"name": preset.name, "device": preset.device, "bands": bands_data(preset.bands)}
+            {
+                "name": preset.name,
+                "device": _device_data(preset.device),
+                "levels": list(preset.levels),
+            }
             for preset in settings.presets
         ],
-        "active_preset": settings.active_preset,
+        "active_preset": _active_preset_data(settings.active_preset),
     }
 
 
@@ -386,7 +493,7 @@ def save_settings(path: Path, settings: Settings) -> None:
 
     text = settings_to_text(settings)
     try:
-        if parse_settings(json.loads(text)) != settings:
+        if parse_settings(cast("object", json.loads(text))) != settings:
             raise SettingsSaveError("Настройки не записаны: результат не совпал с исходными.")
     except SettingsFormatError as err:
         raise SettingsSaveError(f"Настройки не записаны: {err}") from err

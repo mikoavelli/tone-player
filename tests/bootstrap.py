@@ -28,7 +28,7 @@ from error import (
     SettingsSaveError,
     SettingsVersionError,
 )
-from models import Band, PlayerState, Preset, Settings, ToneConfig
+from models import Band, LevelScale, PlayerState, Preset, Settings, ToneConfig
 from settings_store import (
     SETTINGS_NAME,
     load_settings,
@@ -47,6 +47,7 @@ __all__ = [
     "AudioError",
     "Band",
     "BandError",
+    "LevelScale",
     "OutputDevice",
     "PlayerState",
     "Preset",

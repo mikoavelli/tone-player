@@ -1,10 +1,10 @@
 """Пресеты настроек: чистые функции над Settings, без Qt и файлов."""
 
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, replace
 
 from error import PresetError
-from models import Preset, Settings, nyquist_hz
+from models import Band, Preset, Settings
 from settings_store import preset_name_problem
 
 
@@ -43,9 +43,15 @@ def _require(settings: Settings, name: str) -> Preset:
     return preset
 
 
-def save_preset(settings: Settings, name: str, *, overwrite: bool = False) -> Settings:
-    """Сохранить текущие полосы и устройство под именем name и сделать пресет активным.
+def _aligned_levels(levels: Sequence[float], count: int) -> tuple[float, ...]:
+    """Уровни пресета по позициям глобального списка; новые полосы получают 0 дБ."""
+    return tuple(levels[index] if index < len(levels) else 0.0 for index in range(count))
 
+
+def save_preset(settings: Settings, name: str, *, overwrite: bool = False) -> Settings:
+    """Сохранить текущие уровни и устройство под именем name и сделать пресет активным.
+
+    Частоты в пресет не входят: список частот общий для всей программы.
     Существующий пресет заменяется только при overwrite=True; он остаётся на
     своём месте в списке.
     """
@@ -54,7 +60,7 @@ def save_preset(settings: Settings, name: str, *, overwrite: bool = False) -> Se
     if existing is not None and not overwrite:
         raise PresetError(f"Пресет '{existing.name}' уже существует.")
 
-    preset = Preset(name=name, device=settings.device, bands=settings.bands)
+    preset = Preset(name=name, device=settings.device, levels=settings.levels)
     if existing is None:
         presets = (*settings.presets, preset)
     else:
@@ -95,19 +101,18 @@ def rename_preset(settings: Settings, name: str, new_name: str) -> Settings:
 def apply_preset(
     settings: Settings, name: str, available_devices: Collection[str]
 ) -> PresetApplication:
-    """Загрузить полосы и устройство пресета и сделать его активным.
+    """Применить уровни пресета к общему списку частот и выбрать его устройство.
 
+    Уровни берутся по позициям: если глобальный список стал длиннее, новые
+    полосы получают 0 дБ; лишние сохранённые уровни игнорируются.
     Общий уровень не меняется: загрузка пресета не должна неожиданно изменить
     громкость. available_devices — метки устройств, найденных на этом компьютере.
     """
     preset = _require(settings, name)
-    limit = nyquist_hz(settings.sample_rate)
-    too_high = [band.frequency_hz for band in preset.bands if band.frequency_hz >= limit]
-    if too_high:
-        raise PresetError(
-            f"Пресет '{preset.name}' содержит частоту {max(too_high):g} Гц, а при частоте "
-            f"дискретизации {settings.sample_rate} Гц допустимы частоты ниже {limit:g} Гц."
-        )
+    levels = _aligned_levels(preset.levels, len(settings.bands))
+    bands = tuple(
+        Band(band.frequency_hz, level) for band, level in zip(settings.bands, levels, strict=True)
+    )
 
     device = preset.device
     missing: str | None = None
@@ -115,16 +120,17 @@ def apply_preset(
         missing = device
         device = None
     return PresetApplication(
-        settings=replace(settings, bands=preset.bands, device=device, active_preset=preset.name),
+        settings=replace(settings, bands=bands, device=device, active_preset=preset.name),
         missing_device=missing,
     )
 
 
 def is_modified(settings: Settings) -> bool:
-    """Отличаются ли текущие полосы или устройство от активного пресета."""
+    """Отличаются ли текущие уровни или устройство от активного пресета."""
     if settings.active_preset is None:
         return False
     preset = find_preset(settings, settings.active_preset)
     if preset is None:
         return False
-    return settings.bands != preset.bands or settings.device != preset.device
+    expected = _aligned_levels(preset.levels, len(settings.bands))
+    return settings.levels != expected or settings.device != preset.device

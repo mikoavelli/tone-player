@@ -23,7 +23,7 @@ def make_settings(**changes: object) -> Settings:
         "seconds_per_tone": 10.0,
         "sample_rate": 48000,
         "fade_ms": 20.0,
-        "master_level_db": -12.0,
+        "master_gain_db": 0.0,
         "device": "Speakers [MME]",
         "bands": bands(0.0, 1.0, -2.5),
         "presets": (),
@@ -34,14 +34,18 @@ def make_settings(**changes: object) -> Settings:
 
 
 class TestSave(unittest.TestCase):
-    def test_saves_current_bands_and_device_and_activates(self) -> None:
+    def test_saves_current_levels_and_device_and_activates(self) -> None:
         settings = save_preset(make_settings(), "Дом")
 
-        self.assertEqual(
-            settings.presets, (Preset("Дом", "Speakers [MME]", bands(0.0, 1.0, -2.5)),)
-        )
+        self.assertEqual(settings.presets, (Preset("Дом", "Speakers [MME]", (0.0, 1.0, -2.5)),))
         self.assertEqual(settings.active_preset, "Дом")
         validate_settings(settings)
+
+    def test_preset_does_not_contain_frequency_list(self) -> None:
+        preset = save_preset(make_settings(), "Дом").presets[0]
+
+        self.assertFalse(hasattr(preset, "bands"))
+        self.assertEqual(preset.levels, (0.0, 1.0, -2.5))
 
     def test_default_device_is_stored_as_none(self) -> None:
         settings = save_preset(make_settings(device=None), "Дом")
@@ -49,10 +53,10 @@ class TestSave(unittest.TestCase):
         self.assertIsNone(settings.presets[0].device)
 
     def test_master_level_is_not_part_of_a_preset(self) -> None:
-        settings = save_preset(make_settings(master_level_db=-30.0), "Дом")
+        settings = save_preset(make_settings(master_gain_db=-6.0), "Дом")
 
-        self.assertEqual(settings.master_level_db, -30.0)
-        self.assertFalse(hasattr(settings.presets[0], "master_level_db"))
+        self.assertEqual(settings.master_gain_db, -6.0)
+        self.assertFalse(hasattr(settings.presets[0], "master_gain_db"))
 
     def test_name_is_trimmed(self) -> None:
         self.assertEqual(save_preset(make_settings(), "  Дом  ").presets[0].name, "Дом")
@@ -69,7 +73,7 @@ class TestSave(unittest.TestCase):
         # Имя сохраняется в том виде, в каком его ввели.
         self.assertEqual(again.presets[0].name, "дом")
         self.assertEqual(again.active_preset, "дом")
-        self.assertEqual(again.presets[0].bands, bands(3.0, 3.0, 3.0))
+        self.assertEqual(again.presets[0].levels, (3.0, 3.0, 3.0))
         validate_settings(again)
 
     def test_overwrite_keeps_position(self) -> None:
@@ -96,7 +100,7 @@ class TestApply(unittest.TestCase):
         saved = save_preset(make_settings(device="USB [WASAPI]"), "USB")
         self.settings = replace(saved, bands=bands(0.0, 0.0, 0.0), device=None)
 
-    def test_replaces_bands_and_device(self) -> None:
+    def test_replaces_levels_and_device(self) -> None:
         result = apply_preset(self.settings, "usb", ["USB [WASAPI]"])
 
         self.assertEqual(result.settings.bands, bands(0.0, 1.0, -2.5))
@@ -106,10 +110,10 @@ class TestApply(unittest.TestCase):
         validate_settings(result.settings)
 
     def test_master_level_is_kept(self) -> None:
-        settings = replace(self.settings, master_level_db=-40.0)
+        settings = replace(self.settings, master_gain_db=-6.0)
 
         self.assertEqual(
-            apply_preset(settings, "USB", ["USB [WASAPI]"]).settings.master_level_db, -40.0
+            apply_preset(settings, "USB", ["USB [WASAPI]"]).settings.master_gain_db, -6.0
         )
 
     def test_missing_device_falls_back_to_default(self) -> None:
@@ -131,12 +135,32 @@ class TestApply(unittest.TestCase):
         with self.assertRaises(PresetError):
             _ = apply_preset(self.settings, "нет", [])
 
-    def test_frequency_above_nyquist_is_refused(self) -> None:
-        high = Preset("Высокий", None, (Band(30000.0, 0.0),))
-        settings = replace(self.settings, presets=(*self.settings.presets, high))
+    def test_apply_uses_current_global_frequencies(self) -> None:
+        settings = replace(
+            self.settings,
+            bands=(Band(400.0, 0.0), Band(800.0, 0.0), Band(1200.0, 0.0)),
+        )
 
-        with self.assertRaises(PresetError):
-            _ = apply_preset(settings, "Высокий", [])
+        result = apply_preset(settings, "USB", ["USB [WASAPI]"])
+
+        self.assertEqual(
+            result.settings.bands,
+            (Band(400.0, 0.0), Band(800.0, 1.0), Band(1200.0, -2.5)),
+        )
+
+    def test_new_global_bands_get_zero_level(self) -> None:
+        settings = replace(self.settings, bands=bands(0.0, 0.0, 0.0, 0.0, 0.0))
+
+        result = apply_preset(settings, "USB", ["USB [WASAPI]"])
+
+        self.assertEqual(result.settings.levels, (0.0, 1.0, -2.5, 0.0, 0.0))
+
+    def test_extra_saved_levels_are_ignored(self) -> None:
+        settings = replace(self.settings, bands=bands(0.0, 0.0))
+
+        result = apply_preset(settings, "USB", ["USB [WASAPI]"])
+
+        self.assertEqual(result.settings.levels, (0.0, 1.0))
 
 
 class TestRenameAndDelete(unittest.TestCase):
@@ -195,7 +219,7 @@ class TestModified(unittest.TestCase):
     def test_fresh_preset_is_not_modified(self) -> None:
         self.assertFalse(is_modified(save_preset(make_settings(), "Дом")))
 
-    def test_changed_band_or_device_marks_modified(self) -> None:
+    def test_changed_level_or_device_marks_modified(self) -> None:
         saved = save_preset(make_settings(), "Дом")
 
         self.assertTrue(is_modified(replace(saved, bands=bands(0.0, 1.5, -2.5))))
@@ -204,7 +228,21 @@ class TestModified(unittest.TestCase):
     def test_master_level_does_not_mark_modified(self) -> None:
         saved = save_preset(make_settings(), "Дом")
 
-        self.assertFalse(is_modified(replace(saved, master_level_db=-20.0)))
+        self.assertFalse(is_modified(replace(saved, master_gain_db=-6.0)))
+
+    def test_changed_global_frequencies_do_not_mark_modified(self) -> None:
+        saved = save_preset(make_settings(), "Дом")
+        changed = replace(
+            saved,
+            bands=(Band(400.0, 0.0), Band(800.0, 1.0), Band(1200.0, -2.5)),
+        )
+
+        self.assertFalse(is_modified(changed))
+
+    def test_extra_global_bands_with_zero_levels_are_not_modified(self) -> None:
+        saved = save_preset(make_settings(), "Дом")
+
+        self.assertFalse(is_modified(replace(saved, bands=bands(0.0, 1.0, -2.5, 0.0, 0.0))))
 
 
 if __name__ == "__main__":

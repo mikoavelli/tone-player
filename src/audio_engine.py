@@ -15,10 +15,10 @@ import sounddevice as sd
 
 from error import AudioError
 from models import (
-    LEVEL_MAX_DB,
-    LEVEL_MIN_DB,
+    DEFAULT_LEVEL_SCALE,
     MASTER_MAX_DB,
     MASTER_MIN_DB,
+    LevelScale,
     PlaybackProgress,
     PlayerState,
     ToneConfig,
@@ -26,7 +26,7 @@ from models import (
 
 _CHANNELS = 1
 _FALLBACK_CHANNELS = 2
-DEFAULT_DEVICE_LABEL = "Устройство вывода по умолчанию"
+DEFAULT_DEVICE_LABEL = "По умолчанию"
 
 # Размер таблицы синуса — степень двойки, переход фазы выполняется по маске.
 TABLE_SIZE = 8192
@@ -149,16 +149,18 @@ class ToneGenerator:
         master_db: float,
         *,
         autoplay_enabled: bool = True,
+        level_scale: LevelScale = DEFAULT_LEVEL_SCALE,
     ) -> None:
         if len(levels) != config.tone_count:
             raise ValueError("Число уровней должно совпадать с числом частот.")
         self._config = config
         self._autoplay_enabled = autoplay_enabled
         self._master_db = _checked_master(master_db)
+        self._level_scale = level_scale
         # Уровни правятся из интерфейса во время звучания, поэтому живут здесь,
         # а не в неизменяемом ToneConfig. Замена элемента списка атомарна, и
         # поток PortAudio читает значение один раз на блок.
-        self._levels = [_checked_level(level) for level in levels]
+        self._levels = [_checked_level(level, level_scale) for level in levels]
         self.index = 0
         self.frames_in_tone = 0
         self.finished = False
@@ -188,6 +190,11 @@ class ToneGenerator:
         """Поправки уровня всех полос, дБ."""
         return tuple(self._levels)
 
+    @property
+    def level_scale(self) -> LevelScale:
+        """Диапазон и шаг поправок уровня."""
+        return self._level_scale
+
     def level_at(self, index: int) -> float:
         """Поправка уровня полосы по индексу, дБ."""
         return self._levels[index]
@@ -196,7 +203,7 @@ class ToneGenerator:
         """Изменить поправку уровня полосы, дБ; звучащий тон меняется сразу."""
         if not 0 <= index < len(self._levels):
             raise IndexError(f"Нет полосы с номером {index}.")
-        self._levels[index] = _checked_level(level_db)
+        self._levels[index] = _checked_level(level_db, self._level_scale)
 
     @property
     def current_gain_db(self) -> float:
@@ -310,10 +317,10 @@ class ToneGenerator:
             self.finished = True
 
 
-def _checked_level(level_db: float) -> float:
-    if not LEVEL_MIN_DB <= level_db <= LEVEL_MAX_DB:  # NaN тоже не проходит
+def _checked_level(level_db: float, scale: LevelScale) -> float:
+    if not scale.min_db <= level_db <= scale.max_db:  # NaN тоже не проходит
         raise ValueError(
-            f"Поправка полосы {level_db} дБ вне диапазона [{LEVEL_MIN_DB}, {LEVEL_MAX_DB}] дБ."
+            f"Поправка полосы {level_db} дБ вне диапазона [{scale.min_db}, {scale.max_db}] дБ."
         )
     return float(level_db)
 
@@ -340,10 +347,12 @@ class TonePlayer:
         master_db: float,
         device: int | None = None,
         stream_factory: StreamFactory | None = None,
+        level_scale: LevelScale = DEFAULT_LEVEL_SCALE,
     ) -> None:
         self._config = config
         self._stream_factory = sd.RawOutputStream if stream_factory is None else stream_factory
-        self._generator = ToneGenerator(config, levels, master_db)
+        self._level_scale = level_scale
+        self._generator = ToneGenerator(config, levels, master_db, level_scale=level_scale)
         self._state = PlayerState.IDLE
         self._device: int | None = device
         self._channels = _CHANNELS
@@ -406,7 +415,13 @@ class TonePlayer:
         """Изменить общий уровень, дБ от полной шкалы."""
         self._generator.set_master_db(master_db)
 
-    def reconfigure(self, config: ToneConfig, levels: Sequence[float]) -> None:
+    def reconfigure(
+        self,
+        config: ToneConfig,
+        levels: Sequence[float],
+        *,
+        level_scale: LevelScale | None = None,
+    ) -> None:
         """Заменить набор частот, длительности и уровни; только когда звука нет.
 
         Выбранная полоса сохраняется, если она ещё есть в новом наборе, иначе
@@ -414,11 +429,14 @@ class TonePlayer:
         """
         if self._state in (PlayerState.PLAYING, PlayerState.PAUSED):
             raise AudioError("Параметры нельзя менять во время воспроизведения.")
+        if level_scale is not None:
+            self._level_scale = level_scale
         generator = ToneGenerator(
             config,
             levels,
             self._generator.master_db,
             autoplay_enabled=self._generator.advance_allowed(),
+            level_scale=self._level_scale,
         )
         self._close_stream()
         generator.seek(self.tone_index)
@@ -588,17 +606,15 @@ class TonePlayer:
             self._state = PlayerState.FINISHED
 
     def _open_stream(self) -> tuple[AudioStream, int]:
-        """Открыть поток вывода, подбирая число каналов и устройство по умолчанию."""
-        attempts: list[tuple[int | None, int]] = [
-            (self._device, _CHANNELS),
-            (self._device, _FALLBACK_CHANNELS),
-        ]
+        """Открыть поток вывода, подбирая число каналов и устройство."""
+        attempts: list[tuple[int | None, int]] = []
         if self._device is not None:
-            attempts.append((None, _CHANNELS))
-            attempts.append((None, _FALLBACK_CHANNELS))
+            attempts.append((self._device, _CHANNELS))
+            attempts.append((self._device, _FALLBACK_CHANNELS))
+        attempts.append((None, _CHANNELS))
+        attempts.append((None, _FALLBACK_CHANNELS))
 
-        errors: list[str] = []
-        for index, (device, channels) in enumerate(attempts):
+        for device, channels in attempts:
             try:
                 stream = self._stream_factory(
                     samplerate=self._config.sample_rate,
@@ -607,15 +623,19 @@ class TonePlayer:
                     dtype="float32",
                     callback=self._callback,
                 )
-            except PORTAUDIO_ERRORS as err:
-                errors.append(f"устройство {device}, каналов {channels}: {err}")
+            except PORTAUDIO_ERRORS:
                 continue
 
-            if index > 0:
-                self._last_status = "Открыт запасной вариант вывода — " + errors[-1]
+            if self._device is not None and device is None:
+                self._last_status = (
+                    "Выбранное устройство недоступно — используется устройство по умолчанию."
+                )
             return stream, channels
 
-        raise AudioError("Не удалось открыть устройство вывода: " + "; ".join(errors))
+        raise AudioError(
+            "Не удалось открыть аудиовыход. Проверьте, что устройство подключено "
+            "и не занято другой программой."
+        )
 
     def _close_stream(self) -> None:
         stream = self._stream

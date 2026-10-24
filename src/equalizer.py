@@ -6,11 +6,10 @@ from dataclasses import dataclass
 
 from error import BandError, SettingsFormatError
 from models import (
-    LEVEL_MAX_DB,
-    LEVEL_MIN_DB,
+    DEFAULT_LEVEL_SCALE,
     MAX_BANDS,
     Band,
-    snap_to_step,
+    LevelScale,
 )
 from settings_store import validate_bands
 
@@ -23,16 +22,25 @@ _SAME_FREQUENCY_HZ = 1e-6
 # -----------------------------------------------------------------------------
 
 
-def _checked(bands: Sequence[Band], max_frequency_hz: float) -> tuple[Band, ...]:
+def _checked(
+    bands: Sequence[Band],
+    max_frequency_hz: float,
+    scale: LevelScale = DEFAULT_LEVEL_SCALE,
+) -> tuple[Band, ...]:
     try:
-        validate_bands(bands, max_frequency_hz=max_frequency_hz, what="Полосы")
+        validate_bands(bands, max_frequency_hz=max_frequency_hz, what="Полосы", scale=scale)
     except SettingsFormatError as err:
         raise BandError(str(err)) from err
     return tuple(bands)
 
 
 def generate_grid(
-    start_hz: float, step_hz: float, count: int, *, max_frequency_hz: float
+    start_hz: float,
+    step_hz: float,
+    count: int,
+    *,
+    max_frequency_hz: float,
+    scale: LevelScale = DEFAULT_LEVEL_SCALE,
 ) -> tuple[Band, ...]:
     """Равномерная сетка частот; все поправки уровня нулевые."""
     if not math.isfinite(start_hz) or not math.isfinite(step_hz):
@@ -42,17 +50,21 @@ def generate_grid(
     if not 1 <= count <= MAX_BANDS:
         raise BandError(f"Число полос должно быть от 1 до {MAX_BANDS}.")
     bands = [Band(round(start_hz + step_hz * index, 3), 0.0) for index in range(count)]
-    return _checked(bands, max_frequency_hz)
+    return _checked(bands, max_frequency_hz, scale)
 
 
 def insert_band(
-    bands: Sequence[Band], frequency_hz: float, *, max_frequency_hz: float
+    bands: Sequence[Band],
+    frequency_hz: float,
+    *,
+    max_frequency_hz: float,
+    scale: LevelScale = DEFAULT_LEVEL_SCALE,
 ) -> tuple[Band, ...]:
     """Добавить полосу с нулевой поправкой на своё место по частоте."""
     if any(abs(band.frequency_hz - frequency_hz) < _SAME_FREQUENCY_HZ for band in bands):
         raise BandError(f"Полоса {frequency_hz:g} Гц уже есть.")
     merged = sorted([*bands, Band(frequency_hz, 0.0)], key=lambda band: band.frequency_hz)
-    return _checked(merged, max_frequency_hz)
+    return _checked(merged, max_frequency_hz, scale)
 
 
 def remove_band(bands: Sequence[Band], index: int) -> tuple[Band, ...]:
@@ -65,14 +77,19 @@ def remove_band(bands: Sequence[Band], index: int) -> tuple[Band, ...]:
 
 
 def set_frequency(
-    bands: Sequence[Band], index: int, frequency_hz: float, *, max_frequency_hz: float
+    bands: Sequence[Band],
+    index: int,
+    frequency_hz: float,
+    *,
+    max_frequency_hz: float,
+    scale: LevelScale = DEFAULT_LEVEL_SCALE,
 ) -> tuple[Band, ...]:
     """Изменить частоту полосы, не меняя порядка полос; поправка остаётся при ней."""
     if not 0 <= index < len(bands):
         raise BandError(f"Нет полосы с номером {index + 1}.")
     changed = list(bands)
     changed[index] = Band(frequency_hz, bands[index].level_db)
-    return _checked(changed, max_frequency_hz)
+    return _checked(changed, max_frequency_hz, scale)
 
 
 def with_levels(bands: Sequence[Band], levels: Sequence[float]) -> tuple[Band, ...]:
@@ -118,14 +135,17 @@ class FlattenResult:
 
 
 def flatten(
-    levels: Sequence[float], readings: Mapping[int, Reading], master_db: float
+    levels: Sequence[float],
+    readings: Mapping[int, Reading],
+    master_db: float,
+    scale: LevelScale = DEFAULT_LEVEL_SCALE,
 ) -> FlattenResult:
     """Подобрать поправки так, чтобы на всех измеренных частотах давление совпало.
 
     Опора — самая «тихая» полоса: чувствительность (показание минус уровень
     сигнала) у неё наименьшая, а поднять сигнал выше полной шкалы нельзя.
     Она сохраняет свой уровень, остальные опускаются до её давления.
-    Поправки округляются до шага 0,5 дБ, поэтому остаётся неточность до 0,25 дБ;
+    Поправки округляются до шага, поэтому остаётся неточность до половины шага;
     выходящие за диапазон поправки ограничиваются и попадают в `clamped`.
     Полосы без показаний не меняются.
     """
@@ -145,8 +165,8 @@ def flatten(
     clamped: list[int] = []
     for index in sorted(readings):
         wanted_total = anchor + sensitivity[reference] - sensitivity[index]
-        snapped = snap_to_step(wanted_total - master_db)
-        level = min(max(snapped, LEVEL_MIN_DB), LEVEL_MAX_DB)
+        snapped = scale.snap(wanted_total - master_db)
+        level = min(max(snapped, scale.min_db), scale.max_db)
         if level != snapped:
             clamped.append(index)
         new_levels[index] = level

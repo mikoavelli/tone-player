@@ -595,7 +595,7 @@ class TestTonePlayer(unittest.TestCase):
         player = make_player(device=3, stream_factory=factory)
         _ = player.start()
 
-        self.assertIn("запасной вариант", player.last_status)
+        self.assertIn("устройство по умолчанию", player.last_status)
         self.assertEqual(attempts[-1]["device"], None)
 
     def test_stereo_buffer_gets_signal_in_both_channels(self) -> None:

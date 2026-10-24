@@ -4,10 +4,12 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 from tests.bootstrap import (
     SETTINGS_NAME,
     Band,
+    LevelScale,
     Preset,
     Settings,
     SettingsFormatError,
@@ -37,7 +39,7 @@ def make_settings(**changes: object) -> Settings:
         "seconds_per_tone": 10.0,
         "sample_rate": 48000,
         "fade_ms": 20.0,
-        "master_level_db": -12.0,
+        "master_gain_db": 0.0,
         "device": None,
         "bands": make_bands(),
         "presets": (),
@@ -48,7 +50,7 @@ def make_settings(**changes: object) -> Settings:
 
 
 def with_preset(**changes: object) -> Settings:
-    preset = Preset(name="Колонки", device="Speakers [MME]", bands=make_bands(2, 1.5))
+    preset = Preset(name="Колонки", device="Speakers [MME]", levels=(0.0, 1.5))
     return make_settings(presets=(preset,), active_preset="Колонки", **changes)
 
 
@@ -75,11 +77,46 @@ class TestValidation(unittest.TestCase):
         self.assertInvalid(make_settings(fade_ms=2000.0))
 
     def test_master_level_range_and_step(self) -> None:
-        self.assertInvalid(make_settings(master_level_db=0.5))
-        self.assertInvalid(make_settings(master_level_db=-61.0))
-        self.assertInvalid(make_settings(master_level_db=-12.3))
-        validate_settings(make_settings(master_level_db=0.0))
-        validate_settings(make_settings(master_level_db=-60.0))
+        self.assertInvalid(make_settings(master_gain_db=10.5))
+        self.assertInvalid(make_settings(master_gain_db=-10.5))
+        self.assertInvalid(make_settings(master_gain_db=0.3))
+        validate_settings(make_settings(master_gain_db=10.0))
+        validate_settings(make_settings(master_gain_db=-10.0))
+
+    def test_custom_scale_allows_wider_levels(self) -> None:
+        scale = LevelScale(min_db=-12.0, max_db=12.0, step_db=1.0)
+
+        validate_settings(
+            make_settings(level_scale=scale, bands=(Band(500.0, 12.0), Band(1000.0, -12.0)))
+        )
+        self.assertInvalid(make_settings(level_scale=scale, bands=(Band(500.0, 12.5),)))
+
+    def test_scale_with_coarse_step(self) -> None:
+        scale = LevelScale(min_db=-10.0, max_db=10.0, step_db=2.5)
+
+        validate_settings(
+            make_settings(
+                level_scale=scale,
+                bands=(Band(500.0, -10.0), Band(1000.0, 7.5)),
+            )
+        )
+
+    def test_scale_is_validated(self) -> None:
+        cases = (
+            LevelScale(min_db=0.0, max_db=10.0),
+            LevelScale(min_db=-10.0, max_db=0.0),
+            LevelScale(min_db=-40.0, max_db=10.0),
+            LevelScale(min_db=-10.0, max_db=40.0),
+            LevelScale(min_db=-10.0, max_db=10.0, step_db=0.0),
+            LevelScale(min_db=-10.0, max_db=10.0, step_db=0.3),
+            LevelScale(min_db=-10.0, max_db=10.0, step_db=0.8),
+        )
+        for scale in cases:
+            with self.subTest(scale=scale):
+                self.assertInvalid(make_settings(level_scale=scale))
+
+    def test_autoplay_is_boolean(self) -> None:
+        self.assertInvalid(make_settings(autoplay=1))
 
     def test_device_must_not_be_blank(self) -> None:
         self.assertInvalid(make_settings(device="  "))
@@ -112,23 +149,31 @@ class TestValidation(unittest.TestCase):
         self.assertInvalid(make_settings(bands=(Band(500.0, float("inf")),)))
 
     def test_duplicate_preset_names_are_rejected_ignoring_case(self) -> None:
-        first = Preset("Колонки", None, make_bands(1))
-        second = Preset("колонки", None, make_bands(1))
+        first = Preset("Колонки", None, (0.0,))
+        second = Preset("колонки", None, (0.0,))
         self.assertInvalid(make_settings(presets=(first, second)))
 
     def test_preset_name_rules(self) -> None:
         for name in ("", " x", "x ", "a" * 65, "a\tb"):
             with self.subTest(name=name):
-                preset = Preset(name, None, make_bands(1))
+                preset = Preset(name, None, (0.0,))
                 self.assertInvalid(make_settings(presets=(preset,)))
 
-    def test_preset_bands_are_checked(self) -> None:
-        preset = Preset("x", None, (Band(500.0, 99.0),))
-        self.assertInvalid(make_settings(presets=(preset,)))
+    def test_preset_levels_are_checked(self) -> None:
+        for level in (10.5, -10.5, 1.2):
+            with self.subTest(level=level):
+                preset = Preset("x", None, (level,))
+                self.assertInvalid(make_settings(presets=(preset,)))
 
-    def test_preset_may_exceed_current_nyquist(self) -> None:
-        preset = Preset("x", None, (Band(30000.0, 0.0),))
-        validate_settings(make_settings(presets=(preset,)))
+    def test_preset_level_count(self) -> None:
+        self.assertInvalid(make_settings(presets=(Preset("x", None, ()),)))
+        self.assertInvalid(make_settings(presets=(Preset("x", None, (0.0,) * 65),)))
+
+    def test_preset_may_have_different_level_count_than_global_bands(self) -> None:
+        shorter = Preset("Короче", None, (0.0, 1.0))
+        longer = Preset("Длиннее", None, (0.0, 1.0, 2.0, 3.0, 4.0))
+
+        validate_settings(make_settings(presets=(shorter, longer)))
 
     def test_active_preset_must_exist(self) -> None:
         self.assertInvalid(make_settings(active_preset="нет такого"))
@@ -145,12 +190,13 @@ class TestParsing(unittest.TestCase):
     def test_roundtrip_through_data(self) -> None:
         settings = with_preset()
 
-        restored = parse_settings(json.loads(json.dumps(settings_to_data(settings))))
+        payload = cast("object", json.loads(json.dumps(settings_to_data(settings))))
+        restored = parse_settings(payload)
 
         self.assertEqual(restored, settings)
 
     def test_missing_top_level_key(self) -> None:
-        for key in ("playback", "output", "bands", "presets", "active_preset"):
+        for key in ("playback", "output", "levels", "bands", "presets", "active_preset"):
             with self.subTest(key=key):
                 data = self.data()
                 del data[key]
@@ -172,7 +218,7 @@ class TestParsing(unittest.TestCase):
         data = self.data()
         output = data["output"]
         assert isinstance(output, dict)
-        del output["master_level_db"]  # pyright: ignore[reportUnknownVariableType]
+        del output["master_gain_db"]  # pyright: ignore[reportUnknownVariableType]
         self.assertRejected(data)
 
     def test_wrong_types(self) -> None:
@@ -194,8 +240,9 @@ class TestParsing(unittest.TestCase):
             (("playback", "sample_rate"), 48000.0),
             (("playback", "sample_rate"), True),
             (("playback", "seconds_per_tone"), "10"),
-            (("output", "master_level_db"), None),
+            (("output", "master_gain_db"), None),
             (("output", "device"), 5),
+            (("output", "device"), None),
         ):
             with self.subTest(path=path, value=value):
                 data = self.data()
@@ -203,6 +250,49 @@ class TestParsing(unittest.TestCase):
                 assert isinstance(section, dict)
                 section[path[1]] = value  # pyright: ignore[reportUnknownVariableType]
                 self.assertRejected(data)
+
+    def test_default_device_is_serialized_as_default(self) -> None:
+        data = settings_to_data(make_settings())
+
+        output = data["output"]
+        assert isinstance(output, dict)
+        self.assertEqual(output["device"], "default")
+
+    def test_default_device_token_is_accepted(self) -> None:
+        data = self.data()
+        output = data["output"]
+        assert isinstance(output, dict)
+        output["device"] = "default"  # pyright: ignore[reportUnknownVariableType]
+
+        self.assertIsNone(parse_settings(data).device)
+
+    def test_default_preset_device_is_serialized_as_default(self) -> None:
+        preset = Preset("Колонки", None, (0.0, 1.5))
+        data = settings_to_data(make_settings(presets=(preset,), active_preset="Колонки"))
+
+        presets = data["presets"]
+        assert isinstance(presets, list)
+        item = cast("dict[str, object]", presets[0])
+        self.assertEqual(item["device"], "default")
+        self.assertIsNone(parse_settings(data).presets[0].device)
+
+    def test_preset_is_serialized_with_levels_only(self) -> None:
+        data = settings_to_data(with_preset())
+
+        presets = data["presets"]
+        assert isinstance(presets, list)
+        item = cast("dict[str, object]", presets[0])
+        self.assertEqual(item["levels"], [0.0, 1.5])
+        self.assertNotIn("bands", item)
+
+    def test_positional_preset_levels_are_parsed(self) -> None:
+        data = self.data()
+        presets = data["presets"]
+        assert isinstance(presets, list)
+        item = cast("dict[str, object]", presets[0])
+        item["levels"] = [2.0, -3.0, 1.0]
+
+        self.assertEqual(parse_settings(data).presets[0].levels, (2.0, -3.0, 1.0))
 
     def test_integers_are_accepted_as_numbers(self) -> None:
         data = self.data()
@@ -219,12 +309,41 @@ class TestParsing(unittest.TestCase):
         bands[0] = {"frequency_hz": 500.0}  # pyright: ignore[reportUnknownVariableType]
         self.assertRejected(data)
 
-    def test_unsupported_schema_version(self) -> None:
+    def test_preset_must_have_exact_keys(self) -> None:
         data = self.data()
-        data["schema_version"] = 2
+        presets = data["presets"]
+        assert isinstance(presets, list)
+        item = cast("dict[str, object]", presets[0])
+        item["extra"] = 1
 
-        with self.assertRaises(SettingsVersionError):
-            _ = parse_settings(data)
+        self.assertRejected(data)
+
+    def test_old_preset_bands_are_rejected(self) -> None:
+        data = self.data()
+        presets = data["presets"]
+        assert isinstance(presets, list)
+        item = cast("dict[str, object]", presets[0])
+        del item["levels"]
+        item["bands"] = [{"frequency_hz": 500.0, "level_db": 0.0}]
+
+        self.assertRejected(data)
+
+    def test_preset_levels_must_be_numbers(self) -> None:
+        data = self.data()
+        presets = data["presets"]
+        assert isinstance(presets, list)
+        item = cast("dict[str, object]", presets[0])
+        item["levels"] = [0.0, "громко"]
+
+        self.assertRejected(data)
+
+    def test_unsupported_schema_version(self) -> None:
+        for version in (2, 3, 99):
+            with self.subTest(version=version):
+                data = self.data()
+                data["schema_version"] = version
+                with self.assertRaises(SettingsVersionError):
+                    _ = parse_settings(data)
 
     def test_schema_version_must_be_integer(self) -> None:
         data = self.data()
@@ -259,15 +378,15 @@ class TestFile(unittest.TestCase):
         self.assertTrue(text.endswith("\n"))
         self.assertIn('    {"frequency_hz": 500.0, "level_db": 0.0},', text)
         self.assertIn('"name": "Колонки"', text)
-        self.assertEqual(text, settings_to_text(parse_settings(json.loads(text))))
+        self.assertEqual(text, settings_to_text(parse_settings(cast("object", json.loads(text)))))
         self.assertEqual(json.loads(text), settings_to_data(with_preset()))
 
     def test_overwrite_replaces_content(self) -> None:
         save_settings(self.path, make_settings())
 
-        save_settings(self.path, make_settings(master_level_db=-6.0))
+        save_settings(self.path, make_settings(master_gain_db=-6.0))
 
-        self.assertEqual(load_settings(self.path).master_level_db, -6.0)
+        self.assertEqual(load_settings(self.path).master_gain_db, -6.0)
         self.assertEqual(self.names(), [SETTINGS_NAME])
 
     def test_invalid_settings_are_not_written(self) -> None:
@@ -275,7 +394,7 @@ class TestFile(unittest.TestCase):
         before = self.path.read_bytes()
 
         with self.assertRaises(SettingsSaveError):
-            save_settings(self.path, make_settings(master_level_db=5.0))
+            save_settings(self.path, make_settings(master_gain_db=11.0))
 
         self.assertEqual(self.path.read_bytes(), before)
         self.assertEqual(self.names(), [SETTINGS_NAME])
@@ -412,7 +531,7 @@ class TestStartupLoad(unittest.TestCase):
 
     def test_invalid_values_count_as_corruption(self) -> None:
         data = settings_to_data(make_settings())
-        data["output"] = {"device": None, "master_level_db": 5.0}
+        data["output"] = {"device": "default", "master_gain_db": 11.0}
         self.path.write_text(json.dumps(data), encoding="utf-8")
 
         with self.assertRaises(SettingsFormatError):
@@ -437,7 +556,7 @@ class TestShippedSettings(unittest.TestCase):
 
         self.assertEqual(settings.frequencies, tuple(float(f) for f in range(500, 10001, 500)))
         self.assertEqual(set(settings.levels), {0.0})
-        self.assertEqual(settings.master_level_db, -12.0)
+        self.assertEqual(settings.master_gain_db, 0.0)
         self.assertEqual(settings.presets, ())
 
     def test_shipped_file_is_in_canonical_form(self) -> None:

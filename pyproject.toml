@@ -18,10 +18,24 @@ select = ["E", "W", "F", "I", "UP", "S", "B", "N"]
 
 [tool.ruff.lint.per-file-ignores]
 "stubs/**" = ["N818"]
+"tests/**" = ["N802", "S101"]
 
 [tool.ruff.lint.pep8-naming]
 # CamelCase override names, required by Qt (перекрытия событий Qt).
-ignore-names = ["paintEvent", "mouseReleaseEvent", "closeEvent", "setUp", "setUpClass"]
+ignore-names = [
+    "paintEvent",
+    "mouseReleaseEvent",
+    "mousePressEvent",
+    "mouseDoubleClickEvent",
+    "contextMenuEvent",
+    "enterEvent",
+    "leaveEvent",
+    "wheelEvent",
+    "keyPressEvent",
+    "closeEvent",
+    "setUp",
+    "setUpClass",
+]
 
 [tool.basedpyright]
 include = ["src", "tests"]

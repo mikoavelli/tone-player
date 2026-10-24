@@ -10,13 +10,27 @@ from enum import Enum
 # -----------------------------------------------------------------------------
 
 # Поправка уровня полосы эквалайзера относительно общего уровня, дБ.
-LEVEL_STEP_DB = 0.5
-LEVEL_MIN_DB = -10.0
-LEVEL_MAX_DB = 10.0
+# Это значения по умолчанию: диапазон и шаг ползунков хранятся в настройках.
+DEFAULT_LEVEL_STEP_DB = 0.5
+DEFAULT_LEVEL_MIN_DB = -10.0
+DEFAULT_LEVEL_MAX_DB = 10.0
+
+# Старые имена оставлены для кода, которому нужен именно диапазон по умолчанию.
+LEVEL_STEP_DB = DEFAULT_LEVEL_STEP_DB
+LEVEL_MIN_DB = DEFAULT_LEVEL_MIN_DB
+LEVEL_MAX_DB = DEFAULT_LEVEL_MAX_DB
+
+# Допустимые границы настройки диапазона и шага ползунков.
+MIN_LEVEL_SCALE_DB = -30.0
+MAX_LEVEL_SCALE_DB = 30.0
+MIN_LEVEL_STEP_DB = 0.1
+MAX_LEVEL_STEP_DB = 5.0
 
 # Общий уровень относительно полной шкалы, дБ (0 дБ = амплитуда 1.0).
 MASTER_MIN_DB = -60.0
 MASTER_MAX_DB = 0.0
+# Базовый уровень: ползунок мастера показывает смещение от него.
+MASTER_BASE_DB = -12.0
 
 MIN_FREQUENCY_HZ = 20.0
 MAX_BANDS = 64
@@ -35,20 +49,70 @@ MAX_PRESET_NAME_LENGTH = 64
 _STEP_TOLERANCE = 1e-9
 
 
-def on_level_step(value_db: float) -> bool:
-    """Лежит ли значение на сетке шага 0,5 дБ."""
-    steps = value_db / LEVEL_STEP_DB
-    return abs(steps - round(steps)) <= _STEP_TOLERANCE
+@dataclass(frozen=True)
+class LevelScale:
+    """Диапазон и шаг ползунков уровня, дБ.
+
+    Ползунки всех полос и мастера используют одну шкалу, поэтому положение
+    ползунка — это номер деления от `min_db` до `max_db` с шагом `step_db`.
+    """
+
+    min_db: float = DEFAULT_LEVEL_MIN_DB
+    max_db: float = DEFAULT_LEVEL_MAX_DB
+    step_db: float = DEFAULT_LEVEL_STEP_DB
+
+    @property
+    def span_db(self) -> float:
+        """Ширина диапазона, дБ."""
+        return self.max_db - self.min_db
+
+    @property
+    def position_count(self) -> int:
+        """Число шагов между крайними положениями ползунка."""
+        steps = self.span_db / self.step_db
+        return max(int(round(steps)), 1)
+
+    def on_step(self, value_db: float) -> bool:
+        """Лежит ли значение на сетке шага."""
+        steps = value_db / self.step_db
+        return abs(steps - round(steps)) <= _STEP_TOLERANCE
+
+    def snap(self, value_db: float) -> float:
+        """Ближайшее значение на сетке шага."""
+        return round(round(value_db / self.step_db) * self.step_db, 6)
+
+    def clamp(self, value_db: float) -> float:
+        """Значение в пределах диапазона, на сетке шага."""
+        return min(max(self.snap(value_db), self.min_db), self.max_db)
+
+    def position(self, value_db: float) -> int:
+        """Положение ползунка для значения, в шагах от минимума."""
+        position = round((value_db - self.min_db) / self.step_db)
+        return min(max(position, 0), self.position_count)
+
+    def at_position(self, position: int) -> float:
+        """Значение на сетке для положения ползунка."""
+        return round(self.min_db + position * self.step_db, 6)
 
 
-def snap_to_step(value_db: float) -> float:
-    """Ближайшее значение на сетке шага 0,5 дБ."""
-    return round(value_db / LEVEL_STEP_DB) * LEVEL_STEP_DB
+DEFAULT_LEVEL_SCALE = LevelScale()
+# Ползунок мастера всегда ходит на ±10 дБ независимо от диапазона полос.
+MASTER_GAIN_SCALE = LevelScale(DEFAULT_LEVEL_MIN_DB, DEFAULT_LEVEL_MAX_DB, DEFAULT_LEVEL_STEP_DB)
 
 
-def clamp_level(value_db: float) -> float:
+def on_level_step(value_db: float, scale: LevelScale = DEFAULT_LEVEL_SCALE) -> bool:
+    """Лежит ли значение на сетке шага."""
+    return scale.on_step(value_db)
+
+
+def snap_to_step(value_db: float, scale: LevelScale = DEFAULT_LEVEL_SCALE) -> float:
+    """Ближайшее значение на сетке шага."""
+    return scale.snap(value_db)
+
+
+def clamp_level(value_db: float, scale: LevelScale = DEFAULT_LEVEL_SCALE) -> float:
     """Поправка полосы в пределах диапазона, на сетке шага."""
-    return min(max(snap_to_step(value_db), LEVEL_MIN_DB), LEVEL_MAX_DB)
+    return scale.clamp(value_db)
 
 
 def nyquist_hz(sample_rate: int) -> float:
@@ -75,11 +139,11 @@ class Band:
 
 @dataclass(frozen=True)
 class Preset:
-    """Именованный набор полос и устройство вывода, на котором он подобран."""
+    """Именованный набор уровней для общего списка частот и устройство вывода."""
 
     name: str
     device: str | None
-    bands: tuple[Band, ...]
+    levels: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -89,11 +153,13 @@ class Settings:
     seconds_per_tone: float
     sample_rate: int
     fade_ms: float
-    master_level_db: float
+    master_gain_db: float
     device: str | None
     bands: tuple[Band, ...]
     presets: tuple[Preset, ...]
     active_preset: str | None
+    level_scale: LevelScale = DEFAULT_LEVEL_SCALE
+    autoplay: bool = True
 
     @property
     def frequencies(self) -> tuple[float, ...]:
@@ -119,7 +185,7 @@ class ToneConfig:
     fade_ms: float
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "ToneConfig":
+    def from_settings(cls, settings: Settings) -> ToneConfig:
         """Структура сеанса по текущим настройкам."""
         return cls(
             frequencies=settings.frequencies,

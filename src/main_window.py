@@ -1,38 +1,54 @@
-"""Главное окно проигрывателя контрольных тонов."""
+"""Главное окно: эквалайзер, транспорт и настройки."""
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from string import Template
-from typing import Protocol, cast
+from typing import cast
 
-from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QTimer
+from PyQt6.QtCore import (
+    QFileSystemWatcher,
+    QPointF,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+)
 from PyQt6.QtGui import (
     QCloseEvent,
     QColor,
     QFont,
     QFontDatabase,
     QIcon,
-    QMouseEvent,
+    QKeyEvent,
+    QKeySequence,
     QPainter,
     QPaintEvent,
     QPen,
     QPixmap,
     QPolygonF,
+    QShortcut,
+    QWheelEvent,
 )
 from PyQt6.QtWidgets import (
     QAbstractButton,
+    QApplication,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QScrollBar,
     QSizePolicy,
-    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -45,40 +61,62 @@ from audio_engine import (
     find_device,
     list_output_devices,
 )
-from error import AudioError, SettingsError
+from band_widgets import (
+    COLUMN_FREQUENCY_HEIGHT,
+    COLUMN_MARGIN,
+    COLUMN_PLAY_SIZE,
+    COLUMN_SPACING,
+    COLUMN_VALUE_HEIGHT,
+    RULER_SPACING,
+    BandStrip,
+    LevelRuler,
+    LevelSlider,
+    MasterFrame,
+    wheel_scroll_delta,
+)
+from error import AudioError, PresetError, SettingsError
 from models import (
-    LEVEL_STEP_DB,
-    MASTER_MAX_DB,
-    MASTER_MIN_DB,
+    MASTER_BASE_DB,
+    MASTER_GAIN_SCALE,
+    Band,
     PlayerState,
     Settings,
     ToneConfig,
 )
-from settings_store import save_settings
+from presets import apply_preset, delete_preset, find_preset, save_preset
+from settings_dialog import SettingsDialog
+from settings_store import load_settings, save_settings
+from theme import (
+    COLOR_ACCENT,
+    COLOR_ACCENT_HOVER,
+    COLOR_BG,
+    COLOR_BORDER,
+    COLOR_BORDER_HOVER,
+    COLOR_DISABLED,
+    COLOR_ICON,
+    COLOR_ICON_DISABLED,
+    COLOR_MUTED,
+    COLOR_ON_ACCENT,
+    COLOR_SURFACE,
+    COLOR_SURFACE_HOVER,
+    COLOR_SWITCH_OFF,
+    COLOR_TEXT,
+    COLOR_TRACK,
+)
+from ui_signals import connect_action, connect_index, connect_text, connect_toggle
+from ui_text import format_db, format_duration, format_frequency_value
 
 REFRESH_INTERVAL_MS = 50
 # Изменения настроек записываются не на каждый шаг ползунка, а после паузы.
 SAVE_DELAY_MS = 600
+# Служебные сообщения (например, «пресет сохранён») не должны висеть постоянно.
+NOTICE_TIMEOUT_MS = 3500
+# Внешние правки settings.json подхватываются после короткой паузы.
+SETTINGS_RELOAD_DELAY_MS = 250
 
 # -----------------------------------------------------------------------------
 # Оформление
 # -----------------------------------------------------------------------------
-
-COLOR_BG = "#14181d"
-COLOR_SURFACE = "#1b2128"
-COLOR_SURFACE_HOVER = "#222a32"
-COLOR_BORDER = "#2c343d"
-COLOR_BORDER_HOVER = "#3b4651"
-COLOR_TEXT = "#e6ebf0"
-COLOR_MUTED = "#9aa6b2"
-COLOR_DISABLED = "#6b7886"
-COLOR_TRACK = "#232b33"
-COLOR_ACCENT = "#62b6ff"
-COLOR_ACCENT_HOVER = "#7ac2ff"
-COLOR_ON_ACCENT = "#0b1117"
-COLOR_ICON = "#c5ced8"
-COLOR_ICON_DISABLED = "#4d5762"
-COLOR_SWITCH_OFF = "#3a434d"
 
 # Шрифты перечислены по предпочтению: берётся первый установленный в системе,
 # иначе — системный шрифт по умолчанию (или моноширинный).
@@ -92,14 +130,12 @@ _MONO_FAMILIES = (
 )
 
 BASE_FONT_PX = 14
-FREQUENCY_VALUE_PX = 72
-FREQUENCY_UNIT_PX = 30
-TICK_WIDTH = 10.0
-TICK_HEIGHT = 4
-TICK_GAP = 4.0
+FREQUENCY_VALUE_PX = 36
+FREQUENCY_UNIT_PX = 16
+FREQUENCY_BLOCK_WIDTH = 170
 
 _STYLESHEET = Template("""
-QMainWindow {
+QMainWindow, QDialog {
     background-color: $bg;
 }
 QWidget {
@@ -115,26 +151,47 @@ QLabel {
     background: transparent;
 }
 QLabel#toneLabel, QLabel#captionLabel, QLabel#subtitleLabel,
-QLabel#statCaption, QLabel#scaleLabel, QLabel#statusLabel {
+QLabel#statCaption, QLabel#scaleLabel, QLabel#statusLabel,
+QLabel#bandValue, QLabel#bandFrequency, QLabel#sectionLabel,
+QLabel#fieldLabel {
     color: $muted;
 }
 QLabel#subtitleLabel, QLabel#statusLabel {
     font-size: 13px;
 }
-QLabel#statCaption {
+QLabel#captionLabel, QLabel#fieldLabel {
+    font-size: 13px;
+}
+QLabel#sectionLabel {
+    color: $text;
+    font-size: 16px;
+    font-weight: 600;
+    padding-top: 6px;
+}
+QLabel#bandValue {
     font-size: 12px;
 }
-QLabel#titleLabel {
-    font-size: 16px;
-    font-weight: 500;
+QLabel#bandFrequency {
+    font-size: 11px;
 }
+
 QFrame#card, QFrame#statCard {
     background-color: $surface;
     border: 1px solid $border;
     border-radius: 12px;
 }
-QFrame#statCard {
-    border-radius: 10px;
+QFrame#divider {
+    background-color: $border;
+}
+QScrollArea {
+    background: transparent;
+    border: none;
+}
+BandStrip {
+    background: transparent;
+}
+QScrollArea > QWidget > QWidget {
+    background: transparent;
 }
 
 QPushButton {
@@ -171,6 +228,15 @@ QPushButton#navButton:pressed:enabled {
 QPushButton#navButton:disabled {
     background-color: transparent;
 }
+QPushButton#bandPlay {
+    background-color: transparent;
+    border: none;
+    border-radius: 14px;
+    padding: 0;
+}
+QPushButton#bandPlay:hover:enabled {
+    background-color: $track;
+}
 QPushButton#playButton {
     background-color: $accent;
     color: $on_accent;
@@ -196,26 +262,26 @@ QPushButton#playButton:disabled {
 
 QProgressBar {
     border: none;
-    border-radius: 4px;
+    border-radius: 3px;
     background-color: $track;
 }
 QProgressBar::chunk {
     background-color: $accent;
-    border-radius: 4px;
+    border-radius: 3px;
 }
 
-QSlider::groove:horizontal {
-    height: 6px;
+QSlider::groove:vertical {
+    width: 6px;
     background-color: $track;
     border-radius: 3px;
 }
-QSlider::handle:horizontal {
+QSlider::handle:vertical {
     background-color: $accent;
-    width: 18px;
-    margin: -6px 0;
-    border-radius: 9px;
+    height: 16px;
+    margin: 0 -6px;
+    border-radius: 8px;
 }
-QSlider::handle:horizontal:hover {
+QSlider::handle:vertical:hover {
     background-color: $accent_hover;
 }
 
@@ -224,7 +290,7 @@ QComboBox {
     border: 1px solid $border;
     border-radius: 10px;
     padding: 0 12px;
-    font-size: 15px;
+    font-size: 14px;
 }
 QComboBox:hover:enabled {
     border-color: $border_hover;
@@ -237,7 +303,7 @@ QComboBox:disabled {
 }
 QComboBox::drop-down {
     border: none;
-    width: 32px;
+    width: 30px;
 }
 QComboBox::down-arrow {
     image: none;
@@ -249,6 +315,56 @@ QComboBox QAbstractItemView {
     selection-color: $text;
     outline: 0;
     padding: 4px;
+}
+
+QDoubleSpinBox, QSpinBox {
+    background-color: $surface;
+    border: 1px solid $border;
+    border-radius: 8px;
+    padding: 5px 8px;
+    min-height: 24px;
+}
+QDoubleSpinBox:focus, QSpinBox:focus {
+    border-color: $accent;
+}
+QPlainTextEdit {
+    background-color: $surface;
+    border: 1px solid $border;
+    border-radius: 8px;
+    padding: 6px;
+}
+QLineEdit {
+    background-color: $surface;
+    color: $text;
+    border: 1px solid $border;
+    border-radius: 8px;
+    padding: 7px 10px;
+    min-height: 22px;
+    selection-background-color: $accent;
+    selection-color: $on_accent;
+}
+QLineEdit:focus {
+    border-color: $accent;
+}
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 8px;
+    margin: 0;
+}
+QScrollBar::handle:horizontal {
+    background: $border_hover;
+    border-radius: 4px;
+    min-width: 40px;
+}
+QScrollBar::handle:horizontal:hover {
+    background: $muted;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0;
+}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+    background: transparent;
 }
 """).substitute(
     bg=COLOR_BG,
@@ -266,33 +382,8 @@ QComboBox QAbstractItemView {
 )
 
 
-class VoidSignal(Protocol):
-    def connect(self, slot: Callable[[], None], /) -> object: ...
-
-
-class IntSignal(Protocol):
-    def connect(self, slot: Callable[[int], None], /) -> object: ...
-
-
-class BoolSignal(Protocol):
-    def connect(self, slot: Callable[[bool], None], /) -> object: ...
-
-
-def connect_action(signal: VoidSignal, slot: Callable[[], None]) -> None:
-    _ = signal.connect(slot)
-
-
-def connect_index(signal: IntSignal, slot: Callable[[int], None]) -> None:
-    _ = signal.connect(slot)
-
-
-def connect_toggle(signal: BoolSignal, slot: Callable[[bool], None]) -> None:
-    _ = signal.connect(slot)
-
-
-# Вид главной кнопки по режиму: подпись и значок.
 PLAY_BUTTON_LOOK = {
-    "start": ("Старт", "start"),
+    "start": ("Запустить", "start"),
     "pause": ("Пауза", "pause"),
     "resume": ("Продолжить", "start"),
 }
@@ -312,9 +403,9 @@ def autoplay_text(enabled: bool) -> str:
     return "Автовоспроизведение: " + ("включено" if enabled else "выключено")
 
 
-def autoplay_state_text(enabled: bool) -> str:
-    """Короткая подпись состояния автовоспроизведения под заголовком карточки."""
-    return "Включено" if enabled else "Выключено"
+def autoplay_label() -> str:
+    """Постоянная подпись переключателя автовоспроизведения."""
+    return "Автовоспроизведение"
 
 
 def pick_font_family(candidates: Sequence[str], fallback: str) -> str:
@@ -332,7 +423,7 @@ def pick_font_family(candidates: Sequence[str], fallback: str) -> str:
 
 
 def _draw_glyph(kind: str, size: int, color: str) -> QPixmap:
-    """Нарисовать значок kind в квадрате size × size (сетка 24 × 24, как в макете)."""
+    """Нарисовать значок kind в квадрате size × size (сетка 24 × 24)."""
     ratio = 2
     pixmap = QPixmap(size * ratio, size * ratio)
     pixmap.setDevicePixelRatio(ratio)
@@ -343,20 +434,65 @@ def _draw_glyph(kind: str, size: int, color: str) -> QPixmap:
     painter.scale(size / 24, size / 24)
     qcolor = QColor(color)
 
-    if kind in ("previous", "next"):
+    if kind == "settings":
+        painter.setPen(
+            QPen(
+                qcolor,
+                2.0,
+                Qt.PenStyle.SolidLine,
+                Qt.PenCapStyle.RoundCap,
+                Qt.PenJoinStyle.RoundJoin,
+            )
+        )
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QPointF(12.0, 12.0), 4.0, 4.0)
+        for angle in range(0, 360, 45):
+            radians = math.radians(angle)
+            painter.drawLine(
+                QPointF(12.0 + 6.5 * math.cos(radians), 12.0 + 6.5 * math.sin(radians)),
+                QPointF(12.0 + 9.5 * math.cos(radians), 12.0 + 9.5 * math.sin(radians)),
+            )
+    elif kind == "presetSave":
         pen = QPen(
             qcolor,
-            2.0,
+            1.9,
             Qt.PenStyle.SolidLine,
             Qt.PenCapStyle.RoundCap,
             Qt.PenJoinStyle.RoundJoin,
         )
         painter.setPen(pen)
-        points = ((15, 5), (8, 12), (15, 19)) if kind == "previous" else ((9, 5), (16, 12), (9, 19))
-        painter.drawPolyline(QPolygonF([QPointF(x, y) for x, y in points]))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPolygon(
+            QPolygonF(
+                [
+                    QPointF(7.0, 4.0),
+                    QPointF(17.0, 4.0),
+                    QPointF(17.0, 20.0),
+                    QPointF(12.0, 15.5),
+                    QPointF(7.0, 20.0),
+                ]
+            )
+        )
+    elif kind == "delete":
+        painter.setPen(
+            QPen(
+                qcolor,
+                1.8,
+                Qt.PenStyle.SolidLine,
+                Qt.PenCapStyle.RoundCap,
+                Qt.PenJoinStyle.RoundJoin,
+            )
+        )
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawLine(QPointF(5.0, 7.0), QPointF(19.0, 7.0))
+        painter.drawLine(QPointF(9.0, 4.0), QPointF(15.0, 4.0))
+        painter.drawRoundedRect(QRectF(7.0, 7.0, 10.0, 13.0), 2.0, 2.0)
+        painter.drawLine(QPointF(10.0, 10.0), QPointF(10.0, 17.0))
+        painter.drawLine(QPointF(14.0, 10.0), QPointF(14.0, 17.0))
     else:
+        glyph = "start" if kind == "bandStart" else "pause" if kind == "bandPause" else kind
         painter.setBrush(qcolor)
-        if kind == "start":
+        if glyph == "start":
             # Контур того же цвета скругляет углы треугольника.
             painter.setPen(
                 QPen(
@@ -370,10 +506,10 @@ def _draw_glyph(kind: str, size: int, color: str) -> QPixmap:
             painter.drawPolygon(QPolygonF([QPointF(7.5, 5), QPointF(7.5, 19), QPointF(19.5, 12)]))
         else:
             painter.setPen(Qt.PenStyle.NoPen)
-            if kind == "pause":
+            if glyph == "pause":
                 painter.drawRoundedRect(QRectF(6, 4, 4, 16), 1, 1)
                 painter.drawRoundedRect(QRectF(14, 4, 4, 16), 1, 1)
-            elif kind == "stop":
+            elif glyph == "stop":
                 painter.drawRoundedRect(QRectF(5, 5, 14, 14), 2, 2)
     painter.end()
     return pixmap
@@ -389,20 +525,23 @@ def _make_icon(kind: str, size: int, normal: str, disabled: str) -> QIcon:
 def make_icons() -> dict[str, QIcon]:
     """Значки кнопок: цвет в обычном и в отключённом состоянии подобран под тему."""
     return {
-        "previous": _make_icon("previous", 22, COLOR_ICON, COLOR_ICON_DISABLED),
-        "next": _make_icon("next", 22, COLOR_ICON, COLOR_ICON_DISABLED),
         "start": _make_icon("start", 18, COLOR_ON_ACCENT, COLOR_DISABLED),
         "pause": _make_icon("pause", 18, COLOR_ON_ACCENT, COLOR_DISABLED),
         "stop": _make_icon("stop", 18, COLOR_TEXT, COLOR_DISABLED),
+        "settings": _make_icon("settings", 20, COLOR_ICON, COLOR_ICON_DISABLED),
+        "presetSave": _make_icon("presetSave", 18, COLOR_ICON, COLOR_ICON_DISABLED),
+        "delete": _make_icon("delete", 18, COLOR_ICON, COLOR_ICON_DISABLED),
+        "bandStart": _make_icon("bandStart", 14, COLOR_ICON, COLOR_ICON_DISABLED),
+        "bandPause": _make_icon("bandPause", 14, COLOR_ICON, COLOR_ICON_DISABLED),
     }
 
 
 class ToggleSwitch(QAbstractButton):
     """Переключатель-«тумблер»; API как у отмечаемой кнопки (isChecked, toggled)."""
 
-    _TRACK_WIDTH = 52
-    _TRACK_HEIGHT = 30
-    _KNOB = 24
+    _TRACK_WIDTH = 48
+    _TRACK_HEIGHT = 26
+    _KNOB = 20
     _PAD = 3
     _RING = 2
 
@@ -439,60 +578,6 @@ class ToggleSwitch(QAbstractButton):
             )
 
 
-class ClickableFrame(QFrame):
-    """Карточка, щелчок по любой части которой переключает связанный тумблер."""
-
-    def __init__(self, target: QAbstractButton) -> None:
-        super().__init__()
-        self._target = target
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def mouseReleaseEvent(self, a0: QMouseEvent | None) -> None:
-        if (
-            a0 is not None
-            and a0.button() == Qt.MouseButton.LeftButton
-            and self.rect().contains(a0.position().toPoint())
-        ):
-            self._target.toggle()
-        super().mouseReleaseEvent(a0)
-
-
-class ToneTicks(QWidget):
-    """Лента из засечек по числу тонов; текущий тон выделен акцентным цветом."""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._count = 0
-        self._current = 0
-        self.setFixedHeight(TICK_HEIGHT)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
-    def set_state(self, count: int, current: int) -> None:
-        if (count, current) == (self._count, self._current):
-            return
-        self._count = count
-        self._current = current
-        self.update()
-
-    def paintEvent(self, a0: QPaintEvent | None) -> None:
-        if self._count <= 0:
-            return
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(Qt.PenStyle.NoPen)
-
-        available = float(self.width())
-        tick_width = (available - TICK_GAP * (self._count - 1)) / self._count
-        tick_width = max(2.0, min(TICK_WIDTH, tick_width))
-        total = tick_width * self._count + TICK_GAP * (self._count - 1)
-        x = (available - total) / 2
-        radius = TICK_HEIGHT / 2
-        for index in range(self._count):
-            painter.setBrush(QColor(COLOR_ACCENT if index == self._current else COLOR_BORDER))
-            painter.drawRoundedRect(QRectF(x, 0, tick_width, TICK_HEIGHT), radius, radius)
-            x += tick_width + TICK_GAP
-
-
 class ChevronComboBox(QComboBox):
     """Выпадающий список со стрелкой-шевроном, нарисованной в цвет темы."""
 
@@ -510,7 +595,7 @@ class ChevronComboBox(QComboBox):
                 Qt.PenJoinStyle.RoundJoin,
             )
         )
-        center_x = self.width() - 22.0
+        center_x = self.width() - 20.0
         center_y = self.height() / 2
         painter.drawPolyline(
             QPolygonF(
@@ -523,8 +608,29 @@ class ChevronComboBox(QComboBox):
         )
 
 
+class BandScrollArea(QScrollArea):
+    """Прокрутка полос: колесо мыши двигает ленту по горизонтали."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def wheelEvent(self, a0: QWheelEvent | None) -> None:
+        if a0 is None:
+            return
+        bar = self.horizontalScrollBar()
+        if bar is None:
+            return
+        bar.setValue(bar.value() - wheel_scroll_delta(a0))
+        a0.accept()
+
+
 class MainWindow(QMainWindow):
-    """Окно с управлением воспроизведением и индикацией текущей частоты."""
+    """Окно эквалайзера: полосы, мастер, транспорт и настройки."""
 
     def __init__(
         self,
@@ -535,22 +641,32 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._settings = settings
         self._settings_path = settings_path
+        self._settings_file_bytes = self._read_settings_file()
         self._config = ToneConfig.from_settings(settings)
         self._player = TonePlayer(
             self._config,
             settings.levels,
-            settings.master_level_db,
+            MASTER_BASE_DB + settings.master_gain_db,
             stream_factory=stream_factory,
+            level_scale=settings.level_scale,
         )
+        self._player.set_autoplay(settings.autoplay)
         self._devices: list[OutputDevice] = []
         self._finishing_handled = False
         self._play_button_mode = ""
+        self._bands: BandStrip | None = None
+        self._last_band_index = -1
         # Сообщения под окном: о недоступном устройстве и о неудачной записи настроек.
         self._notice = ""
         self._save_error = ""
+        self._notice_timer = QTimer(self)
+        self._notice_timer.setSingleShot(True)
+        self._notice_timer.setInterval(NOTICE_TIMEOUT_MS)
+        connect_action(self._notice_timer.timeout, self._clear_notice)
 
         self.setWindowTitle("TonePlayer")
-        self.resize(560, 680)
+        self.resize(1040, 720)
+        self.setMinimumSize(760, 560)
 
         self._sans_family = pick_font_family(
             _SANS_FAMILIES,
@@ -567,6 +683,25 @@ class MainWindow(QMainWindow):
 
         self._icons = make_icons()
         self._build_ui()
+        self._refresh_presets()
+
+        application = cast("QApplication", QApplication.instance())
+        connect_action(
+            application.focusChanged,
+            lambda: self._on_focus_changed(None, application.focusWidget()),
+        )
+
+        self._space_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
+        self._space_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._space_shortcut.setAutoRepeat(False)
+        connect_action(self._space_shortcut.activated, self._on_play_pause)
+
+        self._settings_shortcut = QShortcut(QKeySequence("Ctrl+,"), self)
+        self._settings_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        connect_action(self._settings_shortcut.activated, self._open_settings)
+
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setFocus()
 
         self._timer = QTimer(self)
         self._timer.setInterval(REFRESH_INTERVAL_MS)
@@ -577,6 +712,14 @@ class MainWindow(QMainWindow):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(SAVE_DELAY_MS)
         connect_action(self._save_timer.timeout, self._save_settings)
+
+        self._settings_watcher = QFileSystemWatcher(self)
+        _ = self._settings_watcher.addPath(str(self._settings_path))
+        connect_text(self._settings_watcher.fileChanged, self._on_settings_file_changed)
+        self._reload_timer = QTimer(self)
+        self._reload_timer.setSingleShot(True)
+        self._reload_timer.setInterval(SETTINGS_RELOAD_DELAY_MS)
+        connect_action(self._reload_timer.timeout, self._reload_settings)
 
         self._refresh()
 
@@ -595,6 +738,8 @@ class MainWindow(QMainWindow):
             self._save_settings()
         if self._save_error:
             _ = QMessageBox.warning(self, "Настройки не сохранены", self._save_error)
+        self._notice_timer.stop()
+        self._reload_timer.stop()
         self._timer.stop()
         self._player.stop()
         super().closeEvent(a0)
@@ -613,17 +758,12 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(32, 24, 32, 24)
-        layout.setSpacing(18)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
 
         layout.addLayout(self._build_header())
-        layout.addLayout(self._build_progress())
-        layout.addLayout(self._build_transport())
-        layout.addWidget(self._build_autoplay_card())
-        layout.addLayout(self._build_level())
-        # Лишняя высота окна уходит сюда: выбор устройства и статус остаются внизу.
-        layout.addStretch(1)
-        layout.addLayout(self._build_device())
+        layout.addLayout(self._build_playback())
+        layout.addLayout(self._build_bands(), 1)
 
         self.status_label = QLabel()
         self.status_label.setObjectName("statusLabel")
@@ -631,51 +771,138 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.status_label)
 
     def _build_header(self) -> QHBoxLayout:
-        """Стрелки переключения тонов и крупная частота с лентой позиции."""
         row = QHBoxLayout()
-        row.setSpacing(16)
+        row.setSpacing(8)
 
-        self.previous_button = self._nav_button("previous", "Предыдущая частота")
-        connect_action(self.previous_button.clicked, self._on_previous_tone)
-        row.addWidget(self.previous_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.settings_button = self._icon_button("settings", "Настройки")
+        connect_action(self.settings_button.clicked, self._open_settings)
+        row.addWidget(self.settings_button)
 
-        center = QVBoxLayout()
-        center.setSpacing(4)
+        self.preset_selector = ChevronComboBox()
+        self.preset_selector.setFixedHeight(38)
+        self.preset_selector.setMinimumWidth(150)
+        self.preset_selector.setMaximumWidth(210)
+        self.preset_selector.setToolTip("Пресет: уровни эквалайзера и устройство вывода")
+        connect_index(self.preset_selector.currentIndexChanged, self._on_preset_changed)
+        row.addWidget(self.preset_selector)
 
-        self.tone_label = QLabel()
-        self.tone_label.setObjectName("toneLabel")
-        self.tone_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        tone_font = self.tone_label.font()
-        tone_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.8)
-        self.tone_label.setFont(tone_font)
-        center.addWidget(self.tone_label)
+        self.preset_save_button = self._icon_button("presetSave", "Сохранить пресет")
+        connect_action(self.preset_save_button.clicked, self._on_save_preset)
+        row.addWidget(self.preset_save_button)
 
-        self.frequency_label = QLabel(self._frequency_html("—", ""))
-        self.frequency_label.setTextFormat(Qt.TextFormat.RichText)
-        self.frequency_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        center.addWidget(self.frequency_label)
+        self.preset_delete_button = self._icon_button("delete", "Удалить пресет")
+        connect_action(self.preset_delete_button.clicked, self._on_delete_preset)
+        row.addWidget(self.preset_delete_button)
 
-        center.addSpacing(6)
-        self.tone_ticks = ToneTicks()
-        center.addWidget(self.tone_ticks)
+        row.addStretch(1)
 
-        row.addLayout(center, 1)
+        self._devices = list_output_devices()
+        device_label = QLabel("Устройство:")
+        device_label.setObjectName("fieldLabel")
+        row.addWidget(device_label)
 
-        self.next_button = self._nav_button("next", "Следующая частота")
-        connect_action(self.next_button.clicked, self._on_next_tone)
-        row.addWidget(self.next_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.device_selector = ChevronComboBox()
+        self.device_selector.setFixedHeight(38)
+        self.device_selector.setMinimumWidth(150)
+        self.device_selector.setMaximumWidth(270)
+        self.device_selector.setToolTip("Устройство вывода")
+        self.device_selector.addItem(DEFAULT_DEVICE_LABEL, None)
+        for device in self._devices:
+            self.device_selector.addItem(device.label, device.index)
+        configured = find_device(self._devices, self._settings.device)
+        self.device_selector.setCurrentIndex(
+            0 if configured is None else self.device_selector.findData(configured.index)
+        )
+        if configured is None and self._settings.device is not None:
+            self._show_notice(
+                f"Устройство «{self._settings.device}» не найдено, выбрано устройство по умолчанию."
+            )
+        self._player.set_device(configured.index if configured is not None else None)
+        connect_index(self.device_selector.currentIndexChanged, self._on_device_changed)
+        row.addWidget(self.device_selector)
+
+        self.autoplay_state_label = QLabel(autoplay_label())
+        self.autoplay_state_label.setObjectName("captionLabel")
+        row.addWidget(self.autoplay_state_label)
+
+        self.autoplay_button = ToggleSwitch()
+        self.autoplay_button.setChecked(self._settings.autoplay)
+        self.autoplay_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.autoplay_button.setAccessibleName(autoplay_text(self._settings.autoplay))
+        self.autoplay_button.setToolTip(
+            "Включено: во время воспроизведения новая частота звучит сразу.\n"
+            "Выключено: частота переключается без звука."
+        )
+        connect_toggle(self.autoplay_button.toggled, self._on_autoplay_toggled)
+        row.addWidget(self.autoplay_button)
         return row
 
-    def _nav_button(self, icon_kind: str, tooltip: str) -> QPushButton:
+    def _icon_button(self, icon_kind: str, tooltip: str) -> QPushButton:
         button = QPushButton()
         button.setObjectName("navButton")
-        button.setFixedSize(48, 48)
+        button.setFixedSize(38, 38)
         button.setIcon(self._icons[icon_kind])
-        button.setIconSize(QSize(22, 22))
+        button.setIconSize(QSize(19, 19))
         button.setToolTip(tooltip)
         button.setAccessibleName(tooltip)
-        button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
         return button
+
+    def _build_playback(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(10)
+
+        self.play_button = QPushButton()
+        self.play_button.setObjectName("playButton")
+        self.play_button.setIcon(self._icons["start"])
+        self.play_button.setIconSize(QSize(18, 18))
+        self.play_button.setFixedSize(38, 38)
+        self.play_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.play_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.play_button.setToolTip("Запустить (Пробел)")
+        self.play_button.setAccessibleName("Запустить")
+        connect_action(self.play_button.clicked, self._on_play_pause)
+        row.addWidget(self.play_button)
+
+        self.stop_button = self._icon_button("stop", "Остановить")
+        self.stop_button.setFixedSize(38, 38)
+        connect_action(self.stop_button.clicked, self._on_stop)
+        row.addWidget(self.stop_button)
+
+        frequency_box = QVBoxLayout()
+        frequency_box.setSpacing(0)
+        self.frequency_label = QLabel(self._frequency_html("—", ""))
+        self.frequency_label.setTextFormat(Qt.TextFormat.RichText)
+        self.frequency_label.setFixedWidth(FREQUENCY_BLOCK_WIDTH)
+        self.frequency_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        frequency_box.addWidget(self.frequency_label)
+
+        self.tone_counter_label = QLabel()
+        self.tone_counter_label.setObjectName("captionLabel")
+        self.tone_counter_label.setFixedWidth(FREQUENCY_BLOCK_WIDTH)
+        self.tone_counter_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        frequency_box.addWidget(self.tone_counter_label)
+        row.addLayout(frequency_box)
+
+        row.addSpacing(8)
+        self.tone_progress = QProgressBar()
+        self.tone_progress.setRange(0, 100)
+        self.tone_progress.setTextVisible(False)
+        self.tone_progress.setFixedHeight(8)
+        self.tone_progress.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        row.addWidget(self.tone_progress, 1)
+
+        self.remaining_label = QLabel()
+        self.remaining_label.setFont(self._mono_font(14, QFont.Weight.DemiBold))
+        self.remaining_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.remaining_label.setMinimumWidth(116)
+        row.addWidget(self.remaining_label)
+        return row
 
     def _frequency_html(self, value: str, unit: str = "Гц") -> str:
         """Частота: число моноширинным акцентным шрифтом и приглушённая единица."""
@@ -691,193 +918,124 @@ class MainWindow(QMainWindow):
             )
         return html
 
-    def _build_progress(self) -> QVBoxLayout:
-        block = QVBoxLayout()
-        block.setSpacing(14)
-        self.tone_progress_value, self.tone_progress = self._add_progress_row(
-            block, "Текущий тон · осталось"
+    def _build_bands(self) -> QGridLayout:
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(4)
+
+        grid.addWidget(self._build_master(), 0, 0)
+
+        divider = QFrame()
+        divider.setObjectName("divider")
+        divider.setFixedWidth(1)
+        grid.addWidget(divider, 0, 1, 2, 1)
+
+        self._band_scroll = BandScrollArea()
+        grid.addWidget(self._band_scroll, 0, 2)
+
+        # Полоса прокрутки — отдельный виджет в своей строке, поэтому она не
+        # отнимает высоту у колонок и мастер выровнен с ними.
+        self._band_bar = QScrollBar(Qt.Orientation.Horizontal)
+        self._band_bar.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        inner = self._band_scroll.horizontalScrollBar()
+        if inner is not None:
+            connect_action(inner.rangeChanged, self._sync_band_bar)
+            connect_index(inner.valueChanged, self._band_bar.setValue)
+            connect_index(self._band_bar.valueChanged, inner.setValue)
+        grid.addWidget(self._band_bar, 1, 2)
+
+        grid.setRowStretch(0, 1)
+        grid.setColumnStretch(2, 1)
+        self._rebuild_bands()
+        self._sync_band_bar()
+        return grid
+
+    def _sync_band_bar(self) -> None:
+        inner = self._band_scroll.horizontalScrollBar()
+        if inner is None:
+            return
+        self._band_bar.setRange(inner.minimum(), inner.maximum())
+        self._band_bar.setPageStep(inner.pageStep())
+        self._band_bar.setSingleStep(inner.singleStep())
+        self._band_bar.setValue(inner.value())
+
+    def _build_master(self) -> QWidget:
+        # Устроен как лента полос: шкала слева, рядом колонка той же ширины и
+        # с теми же отступами, что у полосы.
+        box = QWidget()
+        box.setObjectName("masterBox")
+        row = QHBoxLayout(box)
+        row.setContentsMargins(4, 0, 0, 0)
+        row.setSpacing(RULER_SPACING)
+
+        self.master_ruler = LevelRuler(MASTER_GAIN_SCALE)
+        row.addWidget(self.master_ruler)
+
+        frame = MasterFrame()
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(COLUMN_MARGIN, COLUMN_MARGIN, COLUMN_MARGIN, COLUMN_MARGIN)
+        layout.setSpacing(COLUMN_SPACING)
+
+        self.master_value_label = QLabel()
+        self.master_value_label.setObjectName("bandValue")
+        self.master_value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.master_value_label.setFixedHeight(COLUMN_VALUE_HEIGHT)
+        layout.addWidget(self.master_value_label)
+
+        self.master_slider = LevelSlider(MASTER_GAIN_SCALE)
+        self.master_slider.setAccessibleName("Общая громкость")
+        self.master_slider.setToolTip("Общая громкость\n↑ ↓ — изменить; → — перейти к полосам")
+        connect_index(self.master_slider.valueChanged, self._on_master_changed)
+        connect_index(self.master_slider.navigate_requested, self._navigate)
+        layout.addWidget(self.master_slider, 1)
+        self.master_ruler.set_slider(self.master_slider)
+
+        caption = QLabel("Громкость")
+        caption.setObjectName("bandFrequency")
+        caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        caption.setFixedHeight(COLUMN_FREQUENCY_HEIGHT)
+        caption.setToolTip("Общая громкость")
+        layout.addWidget(caption)
+
+        placeholder = QWidget()
+        placeholder.setFixedHeight(COLUMN_PLAY_SIZE)
+        layout.addWidget(placeholder)
+
+        row.addWidget(frame)
+
+        self._master_frame = frame
+        self._sync_master()
+        return box
+
+    def _rebuild_bands(self) -> None:
+        focused_index: int | None = None
+        focus = QApplication.focusWidget()
+        if focus is not None and self._bands is not None:
+            for index in range(len(self._settings.bands)):
+                if focus is self._bands.column(index).slider:
+                    focused_index = index
+                    break
+        if self._bands is not None:
+            self._bands.deleteLater()
+        strip = BandStrip(
+            self._settings.level_scale,
+            self._icons,
+            on_level=self._on_band_level,
+            on_play=self._on_band_play,
+            on_select=self._on_band_select,
+            on_navigate=self._navigate,
+            on_scroll=self._scroll_bands,
         )
-        self.total_progress_value, self.total_progress = self._add_progress_row(
-            block, "Общее время · осталось"
-        )
-        return block
-
-    def _add_progress_row(self, block: QVBoxLayout, caption: str) -> tuple[QLabel, QProgressBar]:
-        """Строка «подпись — время и процент» над тонкой полосой прогресса."""
-        row = QVBoxLayout()
-        row.setSpacing(8)
-
-        header = QHBoxLayout()
-        caption_label = QLabel(caption)
-        caption_label.setObjectName("captionLabel")
-        value_label = QLabel()
-        value_label.setTextFormat(Qt.TextFormat.RichText)
-        value_label.setFont(self._mono_font(16))
-        header.addWidget(caption_label)
-        header.addStretch(1)
-        header.addWidget(value_label)
-        row.addLayout(header)
-
-        bar = QProgressBar()
-        bar.setRange(0, 100)
-        bar.setTextVisible(False)
-        bar.setFixedHeight(8)
-        row.addWidget(bar)
-
-        block.addLayout(row)
-        return value_label, bar
-
-    def _build_transport(self) -> QHBoxLayout:
-        row = QHBoxLayout()
-        row.setSpacing(12)
-
-        # Одна главная кнопка: «Старт», «Пауза» или «Продолжить» по состоянию.
-        self.play_button = self._action_button("Старт", "start")
-        self.play_button.setObjectName("playButton")
-        connect_action(self.play_button.clicked, self._on_play_pause)
-        self.stop_button = self._action_button("Стоп", "stop")
-        connect_action(self.stop_button.clicked, self._on_stop)
-
-        # Главное действие вдвое шире «Стопа».
-        row.addWidget(self.play_button, 2)
-        row.addWidget(self.stop_button, 1)
-        return row
-
-    def _action_button(self, text: str, icon_kind: str) -> QPushButton:
-        button = QPushButton(text)
-        button.setFixedHeight(56)
-        button.setIcon(self._icons[icon_kind])
-        button.setIconSize(QSize(18, 18))
-        button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        button.setCursor(Qt.CursorShape.PointingHandCursor)
-        return button
-
-    def _build_autoplay_card(self) -> QFrame:
-        tooltip = (
-            "Включено: во время воспроизведения новая частота звучит сразу.\n"
-            "Выключено: частота переключается без звука, запуск — кнопкой «Старт»."
-        )
-        self.autoplay_button = ToggleSwitch()
-        self.autoplay_button.setChecked(True)
-        self.autoplay_button.setAccessibleName(autoplay_text(True))
-        self.autoplay_button.setToolTip(tooltip)
-        connect_toggle(self.autoplay_button.toggled, self._on_autoplay_toggled)
-
-        card = ClickableFrame(self.autoplay_button)
-        card.setObjectName("card")
-        card.setToolTip(tooltip)
-        row = QHBoxLayout(card)
-        row.setContentsMargins(16, 12, 16, 12)
-        row.setSpacing(12)
-
-        texts = QVBoxLayout()
-        texts.setSpacing(2)
-        title = QLabel("Автовоспроизведение")
-        title.setObjectName("titleLabel")
-        self.autoplay_state_label = QLabel(autoplay_state_text(True))
-        self.autoplay_state_label.setObjectName("subtitleLabel")
-        for label in (title, self.autoplay_state_label):
-            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-            texts.addWidget(label)
-
-        row.addLayout(texts, 1)
-        row.addWidget(self.autoplay_button)
-        return card
-
-    def _build_level(self) -> QVBoxLayout:
-        block = QVBoxLayout()
-        block.setSpacing(12)
-
-        header = QHBoxLayout()
-        caption = QLabel("Общий уровень")
-        caption.setObjectName("captionLabel")
-        self.level_label = QLabel()
-        self.level_label.setFont(self._mono_font(24, QFont.Weight.DemiBold))
-        header.addWidget(caption, 0, Qt.AlignmentFlag.AlignBottom)
-        header.addStretch(1)
-        header.addWidget(self.level_label)
-        block.addLayout(header)
-
-        slider_block = QVBoxLayout()
-        slider_block.setSpacing(4)
-        self.level_slider = QSlider(Qt.Orientation.Horizontal)
-        self.level_slider.setRange(level_to_slider(MASTER_MIN_DB), level_to_slider(MASTER_MAX_DB))
-        self.level_slider.setSingleStep(1)
-        self.level_slider.setPageStep(level_to_slider(2.0))
-        self.level_slider.setToolTip(f"Общий уровень сигнала, шаг {LEVEL_STEP_DB:g} дБ")
-        self.level_slider.setValue(level_to_slider(self._settings.master_level_db))
-        connect_index(self.level_slider.valueChanged, self._on_level_changed)
-        slider_block.addWidget(self.level_slider)
-
-        scale = QHBoxLayout()
-        scale.setContentsMargins(4, 0, 4, 0)
-        scale.addWidget(self._scale_label(MASTER_MIN_DB))
-        scale.addStretch(1)
-        scale.addWidget(self._scale_label((MASTER_MIN_DB + MASTER_MAX_DB) / 2.0))
-        scale.addStretch(1)
-        scale.addWidget(self._scale_label(MASTER_MAX_DB))
-        slider_block.addLayout(scale)
-        block.addLayout(slider_block)
-
-        stats = QHBoxLayout()
-        stats.setSpacing(10)
-        tone_card, self.tone_gain_label = self._stat_card("Полоса")
-        total_card, self.total_gain_label = self._stat_card("Итого")
-        for card in (tone_card, total_card):
-            stats.addWidget(card, 1)
-        block.addLayout(stats)
-        return block
-
-    def _scale_label(self, value_db: float) -> QLabel:
-        label = QLabel(format_scale(value_db))
-        label.setObjectName("scaleLabel")
-        label.setFont(self._mono_font(13))
-        return label
-
-    def _stat_card(self, caption: str) -> tuple[QFrame, QLabel]:
-        """Карточка «подпись — значение» для показателей уровня."""
-        card = QFrame()
-        card.setObjectName("statCard")
-        box = QVBoxLayout(card)
-        box.setContentsMargins(12, 8, 12, 8)
-        box.setSpacing(0)
-
-        caption_label = QLabel(caption)
-        caption_label.setObjectName("statCaption")
-        value_label = QLabel()
-        value_label.setFont(self._mono_font(17, QFont.Weight.DemiBold))
-        box.addWidget(caption_label)
-        box.addWidget(value_label)
-        return card, value_label
-
-    def _build_device(self) -> QVBoxLayout:
-        block = QVBoxLayout()
-        block.setSpacing(8)
-
-        caption = QLabel("Устройство вывода")
-        caption.setObjectName("captionLabel")
-        block.addWidget(caption)
-
-        self.device_selector = ChevronComboBox()
-        self.device_selector.setFixedHeight(44)
-        self.device_selector.addItem(DEFAULT_DEVICE_LABEL, None)
-        self._devices = list_output_devices()
-        for device in self._devices:
-            self.device_selector.addItem(device.label, device.index)
-        configured = find_device(self._devices, self._settings.device)
-        if configured is not None:
-            self.device_selector.setCurrentIndex(self.device_selector.findData(configured.index))
-        elif self._settings.device is not None:
-            # В файле остаётся прежняя метка: на компьютере, где устройство есть,
-            # оно снова выберется само.
-            self._notice = (
-                f"Устройство «{self._settings.device}» не найдено, "
-                "выбрано устройство по умолчанию."
-            )
-        self._player.set_device(configured.index if configured is not None else None)
-        connect_index(self.device_selector.currentIndexChanged, self._on_device_changed)
-        block.addWidget(self.device_selector)
-        return block
+        strip.set_bands(self._settings.bands, self._settings.level_scale)
+        self._bands = strip
+        self._band_scroll.setWidget(strip)
+        self._last_band_index = -1
+        if focused_index is not None:
+            index = min(focused_index, len(self._settings.bands) - 1)
+        else:
+            index = min(self._player.tone_index, len(self._settings.bands) - 1)
+        strip.column(index).slider.setFocus()
 
     # -------------------------------------------------------------------------
     # Обработчики
@@ -893,39 +1051,90 @@ class MainWindow(QMainWindow):
             self._player.resume()
             self._refresh()
         else:
-            # После завершения сеанса запуск идёт заново с первой частоты,
-            # после ручного переключения — с выбранной.
             index = 0 if state is PlayerState.FINISHED else self._player.tone_index
             self._start_playback(index)
 
-    def _on_previous_tone(self) -> None:
-        self._navigate(-1)
-
-    def _on_next_tone(self) -> None:
-        self._navigate(1)
-
     def _on_autoplay_toggled(self, enabled: bool) -> None:
         self._player.set_autoplay(enabled)
-        self.autoplay_state_label.setText(autoplay_state_text(enabled))
+        self._update_autoplay_text(enabled)
+        self._store(replace(self._settings, autoplay=enabled))
+
+    def _update_autoplay_text(self, enabled: bool) -> None:
         self.autoplay_button.setAccessibleName(autoplay_text(enabled))
 
-    def _navigate(self, offset: int) -> None:
-        """Сменить выбранную частоту.
-
-        Новая частота звучит сразу только если воспроизведение уже идёт и
-        автовоспроизведение включено. До запуска, на паузе и после завершения
-        сеанса частота лишь выбирается: запуск — кнопкой «Старт», продолжение —
-        кнопкой «Продолжить».
-        """
-        index = min(max(self._player.tone_index + offset, 0), self._config.tone_count - 1)
-        if index == self._player.tone_index:
+    def keyPressEvent(self, a0: QKeyEvent | None) -> None:
+        if a0 is None:
+            super().keyPressEvent(a0)
             return
-        if self._player.state is PlayerState.PLAYING and self.autoplay_button.isChecked():
+        if a0.modifiers() == Qt.KeyboardModifier.NoModifier:
+            key = a0.key()
+            if key == Qt.Key.Key_Left:
+                self._navigate(-1)
+                a0.accept()
+                return
+            if key == Qt.Key.Key_Right:
+                self._navigate(1)
+                a0.accept()
+                return
+            if key == Qt.Key.Key_Up:
+                self._nudge_active_band(1)
+                a0.accept()
+                return
+            if key == Qt.Key.Key_Down:
+                self._nudge_active_band(-1)
+                a0.accept()
+                return
+            if key == Qt.Key.Key_Space:
+                self._on_play_pause()
+                a0.accept()
+                return
+        super().keyPressEvent(a0)
+
+    def _navigate(self, offset: int) -> None:
+        if self.master_slider.hasFocus():
+            if offset > 0:
+                self._focus_band(self._player.tone_index)
+            return
+        if offset < 0 and self._player.tone_index == 0:
+            focus = QApplication.focusWidget()
+            first_slider = self._bands.column(0).slider if self._bands is not None else None
+            if focus is self or focus is first_slider:
+                self.master_slider.setFocus()
+                return
+        index = min(max(self._player.tone_index + offset, 0), self._config.tone_count - 1)
+        self._select_band(index)
+
+    def _focus_band(self, index: int) -> None:
+        if self._bands is not None:
+            self._bands.column(index).slider.setFocus()
+
+    def _scroll_bands(self, delta: int) -> None:
+        bar = self._band_scroll.horizontalScrollBar()
+        if bar is not None:
+            bar.setValue(bar.value() - delta)
+
+    def _nudge_active_band(self, direction: int) -> None:
+        index = self._player.tone_index
+        scale = self._settings.level_scale
+        level = scale.clamp(self._settings.bands[index].level_db + direction * scale.step_db)
+        if level != self._settings.bands[index].level_db:
+            self._on_band_level(index, level)
+        if self._bands is not None:
+            self._bands.column(index).set_level(level)
+
+    def _select_band(self, index: int) -> None:
+        """Выбрать полосу; во время звучания новая частота звучит сразу, если включён авторежим."""
+        if index == self._player.tone_index and self._player.state is not PlayerState.FINISHED:
+            self._focus_band(index)
+            return
+        if self._player.state is PlayerState.PLAYING and self._settings.autoplay:
             self._start_playback(index)
+            self._focus_band(index)
             return
         self._player.select(index)
         self._finishing_handled = False
         self._refresh()
+        self._focus_band(index)
 
     def _start_playback(self, index: int) -> None:
         """Запустить воспроизведение с тона index, показав ошибку устройства."""
@@ -942,10 +1151,35 @@ class MainWindow(QMainWindow):
         self._finishing_handled = False
         self._refresh()
 
-    def _on_level_changed(self, value: int) -> None:
-        master_db = slider_to_level(value)
-        self._player.set_master_db(master_db)
-        self._store(replace(self._settings, master_level_db=master_db))
+    def _on_band_level(self, index: int, level_db: float) -> None:
+        self._player.set_level_at(index, level_db)
+        bands = tuple(
+            Band(band.frequency_hz, level_db) if number == index else band
+            for number, band in enumerate(self._settings.bands)
+        )
+        self._store(replace(self._settings, bands=bands))
+
+    def _on_band_select(self, index: int) -> None:
+        self._select_band(index)
+
+    def _on_band_play(self, index: int) -> None:
+        self._focus_band(index)
+        state = self._player.state
+        if index == self._player.tone_index:
+            if state is PlayerState.PLAYING:
+                self._player.pause()
+                self._refresh()
+                return
+            if state is PlayerState.PAUSED:
+                self._player.resume()
+                self._refresh()
+                return
+        self._start_playback(index)
+
+    def _on_master_changed(self, position: int) -> None:
+        gain_db = MASTER_GAIN_SCALE.at_position(position)
+        self._player.set_master_db(MASTER_BASE_DB + gain_db)
+        self._store(replace(self._settings, master_gain_db=gain_db))
         self._refresh()
 
     def _on_device_changed(self, index: int) -> None:
@@ -955,8 +1189,189 @@ class MainWindow(QMainWindow):
             self._player.set_device(device.index if device is not None else None)
         except AudioError:
             return
-        self._notice = ""
+        self._show_notice("")
         self._store(replace(self._settings, device=device.label if device is not None else None))
+        self._refresh()
+
+    def _open_settings(self) -> None:
+        dialog = SettingsDialog(self._settings, self)
+        dialog.setStyleSheet(self.styleSheet())
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._apply_settings(dialog.settings())
+
+    def _apply_settings(
+        self,
+        settings: Settings,
+        *,
+        notice: str = "",
+        persist: bool = True,
+    ) -> None:
+        """Применить настройки целиком: остановить звук, пересобрать полосы и ползунки."""
+        self._player.stop()
+        self._settings = settings
+        self._config = ToneConfig.from_settings(settings)
+        self._player.reconfigure(self._config, settings.levels, level_scale=settings.level_scale)
+        self._player.set_master_db(MASTER_BASE_DB + settings.master_gain_db)
+        self._player.set_autoplay(settings.autoplay)
+        configured = find_device(self._devices, settings.device)
+        self._player.set_device(configured.index if configured is not None else None)
+        text = notice
+        if configured is None and settings.device is not None:
+            text = f"Устройство «{settings.device}» не найдено, выбрано устройство по умолчанию."
+        self._show_notice(text)
+        self._sync_device_selector()
+        self._sync_autoplay()
+        self._sync_master()
+        self._rebuild_bands()
+        self._refresh_presets()
+        if persist:
+            self._store(settings)
+        self._refresh()
+
+    def _sync_device_selector(self) -> None:
+        target = self._player.device
+        self.device_selector.blockSignals(True)
+        index = 0 if target is None else self.device_selector.findData(target)
+        self.device_selector.setCurrentIndex(max(index, 0))
+        self.device_selector.blockSignals(False)
+
+    def _sync_autoplay(self) -> None:
+        self.autoplay_button.blockSignals(True)
+        self.autoplay_button.setChecked(self._settings.autoplay)
+        self.autoplay_button.blockSignals(False)
+        self._update_autoplay_text(self._settings.autoplay)
+
+    def _sync_master(self) -> None:
+        position = MASTER_GAIN_SCALE.position(self._settings.master_gain_db)
+        self.master_slider.blockSignals(True)
+        self.master_slider.setValue(position)
+        self.master_slider.blockSignals(False)
+        self.master_value_label.setText(format_db(self._settings.master_gain_db, unit=False))
+
+    def _on_focus_changed(self, _old: QWidget | None, new: QWidget | None) -> None:
+        master_focused = new is self.master_slider
+        self._master_frame.set_focused(master_focused)
+        if self._bands is not None:
+            self._bands.set_master_focused(master_focused)
+
+    def _refresh_presets(self) -> None:
+        self.preset_selector.blockSignals(True)
+        self.preset_selector.clear()
+        self.preset_selector.addItem("По умолчанию", None)
+        for preset in self._settings.presets:
+            self.preset_selector.addItem(preset.name, preset.name)
+        if self._settings.active_preset is not None:
+            index = self.preset_selector.findData(self._settings.active_preset)
+            if index >= 0:
+                self.preset_selector.setCurrentIndex(index)
+        self.preset_selector.blockSignals(False)
+        self.preset_delete_button.setEnabled(self._settings.active_preset is not None)
+
+    def _on_preset_changed(self, index: int) -> None:
+        data = cast("object", self.preset_selector.itemData(index))
+        if data is None:
+            if self._settings.active_preset is not None:
+                self._store(replace(self._settings, active_preset=None))
+                self.preset_delete_button.setEnabled(False)
+            return
+        name = str(data)
+        available = {device.label for device in self._devices}
+        try:
+            application = apply_preset(self._settings, name, available)
+        except PresetError as error:
+            _ = QMessageBox.warning(self, "Пресет не применён", str(error))
+            self._refresh_presets()
+            return
+        notice = ""
+        if application.missing_device is not None:
+            notice = (
+                f"Устройство «{application.missing_device}» из пресета не найдено, "
+                "выбрано устройство по умолчанию."
+            )
+        self._apply_settings(application.settings, notice=notice)
+
+    def _ask_preset_name(self, default: str) -> str | None:
+        """Запросить имя пресета в оформленном диалоге."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Сохранить пресет")
+        dialog.setMinimumWidth(400)
+        dialog.setStyleSheet(self.styleSheet())
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+        layout.addWidget(QLabel("Имя пресета:"))
+
+        edit = QLineEdit(default)
+        edit.setFixedHeight(38)
+        edit.selectAll()
+        layout.addWidget(edit)
+
+        buttons = QDialogButtonBox()
+        save = cast(
+            "QPushButton",
+            buttons.addButton("Сохранить", QDialogButtonBox.ButtonRole.AcceptRole),
+        )
+        _ = buttons.addButton("Отмена", QDialogButtonBox.ButtonRole.RejectRole)
+        save.setDefault(True)
+        save.setObjectName("playButton")
+        buttons.setFixedHeight(38)
+        connect_action(buttons.accepted, dialog.accept)
+        connect_action(buttons.rejected, dialog.reject)
+        connect_action(edit.returnPressed, dialog.accept)
+        layout.addWidget(buttons)
+
+        edit.setFocus()
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return edit.text()
+
+    def _on_save_preset(self) -> None:
+        default = self._settings.active_preset or "Пресет"
+        name = self._ask_preset_name(default)
+        if name is None:
+            return
+        try:
+            existing = find_preset(self._settings, name.strip())
+            overwrite = False
+            if existing is not None:
+                answer = QMessageBox.question(
+                    self,
+                    "Пресет уже существует",
+                    f"Заменить пресет «{existing.name}»?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+                overwrite = True
+            settings = save_preset(self._settings, name, overwrite=overwrite)
+        except PresetError as error:
+            _ = QMessageBox.warning(self, "Пресет не сохранён", str(error))
+            return
+        self._show_notice(f"Пресет «{settings.active_preset}» сохранён.")
+        self._store(settings)
+        self._refresh_presets()
+        self._refresh()
+
+    def _on_delete_preset(self) -> None:
+        name = self._settings.active_preset
+        if name is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Удалить пресет",
+            f"Удалить пресет «{name}»?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            settings = delete_preset(self._settings, name)
+        except PresetError as error:
+            _ = QMessageBox.warning(self, "Пресет не удалён", str(error))
+            return
+        self._store(settings)
+        self._refresh_presets()
         self._refresh()
 
     def _store(self, settings: Settings) -> None:
@@ -964,14 +1379,69 @@ class MainWindow(QMainWindow):
         self._settings = settings
         self._save_timer.start()
 
+    def _show_notice(self, text: str) -> None:
+        """Показать служебное сообщение и убрать его через несколько секунд."""
+        self._notice = text
+        if text:
+            self._notice_timer.start()
+        else:
+            self._notice_timer.stop()
+
+    def _clear_notice(self) -> None:
+        if not self._notice:
+            return
+        self._notice = ""
+        self._refresh()
+
+    def _read_settings_file(self) -> bytes:
+        try:
+            return self._settings_path.read_bytes()
+        except OSError:
+            return b""
+
+    def _on_settings_file_changed(self, path: str) -> None:
+        if Path(path) != self._settings_path:
+            return
+        # Редакторы часто заменяют файл целиком; после этого наблюдение нужно вернуть.
+        _ = self._settings_watcher.addPath(str(self._settings_path))
+        self._reload_timer.start()
+
+    def _reload_settings(self) -> None:
+        """Подхватить settings.json, изменённый снаружи, не затирая его."""
+        _ = self._settings_watcher.addPath(str(self._settings_path))
+        content = self._read_settings_file()
+        if not content or content == self._settings_file_bytes:
+            return
+        self._save_timer.stop()
+        try:
+            settings = load_settings(self._settings_path)
+        except SettingsError as error:
+            self._show_notice(f"Не удалось перечитать настройки: {error}")
+            self._refresh()
+            return
+        self._settings_file_bytes = content
+        if settings == self._settings:
+            return
+        self._apply_settings(
+            settings,
+            notice="Настройки перечитаны из файла.",
+            persist=False,
+        )
+
     def _save_settings(self) -> None:
         self._save_timer.stop()
+        content = self._read_settings_file()
+        if content and content != self._settings_file_bytes:
+            self._reload_settings()
+            return
         try:
             save_settings(self._settings_path, self._settings)
         except SettingsError as error:
             self._save_error = str(error)
         else:
             self._save_error = ""
+            self._settings_file_bytes = self._read_settings_file()
+            _ = self._settings_watcher.addPath(str(self._settings_path))
 
     # -------------------------------------------------------------------------
     # Обновление состояния
@@ -990,84 +1460,35 @@ class MainWindow(QMainWindow):
         self.frequency_label.setText(
             self._frequency_html(format_frequency_value(self._player.current_frequency))
         )
-
-        self.tone_label.setText(f"Тон {progress.tone_index + 1} из {self._config.tone_count}")
-        self.tone_ticks.set_state(self._config.tone_count, progress.tone_index)
-
-        tone_percent = int(round(progress.tone_fraction * 100))
-        total_percent = int(round(progress.total_fraction * 100))
-        self.tone_progress_value.setText(
-            progress_value_html(format_duration(progress.tone_remaining), tone_percent)
+        self.tone_counter_label.setText(
+            f"Тон {progress.tone_index + 1} из {self._config.tone_count}"
         )
-        self.total_progress_value.setText(
-            progress_value_html(format_duration(progress.total_remaining), total_percent)
-        )
-        self.tone_progress.setValue(tone_percent)
-        self.total_progress.setValue(total_percent)
+        self.remaining_label.setText(f"осталось {format_duration(progress.tone_remaining)}")
+        self.tone_progress.setValue(int(round(progress.tone_fraction * 100)))
 
         self.stop_button.setEnabled(state in (PlayerState.PLAYING, PlayerState.PAUSED))
         self.device_selector.setEnabled(state not in (PlayerState.PLAYING, PlayerState.PAUSED))
-        self.previous_button.setEnabled(progress.tone_index > 0)
-        self.next_button.setEnabled(progress.tone_index < self._config.tone_count - 1)
 
         mode = play_button_mode(state)
         if mode != self._play_button_mode:
             self._play_button_mode = mode
-            text, icon_kind = PLAY_BUTTON_LOOK[mode]
-            self.play_button.setText(text)
+            label, icon_kind = PLAY_BUTTON_LOOK[mode]
             self.play_button.setIcon(self._icons[icon_kind])
+            self.play_button.setToolTip(f"{label} (Пробел)")
+            self.play_button.setAccessibleName(label)
 
-        # Пустая строка статуса скрывается: иначе она занимает высоту и отступ
-        # и оставляет пустое место под выбором устройства.
+        if self._bands is not None:
+            self._bands.set_current(progress.tone_index, state is PlayerState.PLAYING)
+            if progress.tone_index != self._last_band_index:
+                self._last_band_index = progress.tone_index
+                self._band_scroll.ensureWidgetVisible(
+                    self._bands.column(progress.tone_index), 48, 0
+                )
+
+        self.master_value_label.setText(
+            format_db(self._player.master_db - MASTER_BASE_DB, unit=False)
+        )
+
         status = self._player.last_status or self._save_error or self._notice
         self.status_label.setText(status)
         self.status_label.setVisible(bool(status))
-
-        master_db = self._player.master_db
-        level_db = self._player.level_at(progress.tone_index)
-        self.level_label.setText(format_db(master_db))
-        self.tone_gain_label.setText(format_db(level_db))
-        # Выше полной шкалы сигнал не поднимается, поэтому «Итого» не больше 0 дБ.
-        self.total_gain_label.setText(format_db(min(master_db + level_db, 0.0)))
-
-
-def format_frequency_value(frequency: float) -> str:
-    """Число частоты с пробелом как разделителем тысяч, без единицы измерения."""
-    return f"{frequency:,.0f}".replace(",", " ")
-
-
-def format_duration(seconds: float) -> str:
-    """Человекочитаемое время: минуты и секунды с округлением вверх."""
-    total = int(math.ceil(max(seconds, 0.0)))
-    return f"{total // 60}:{total % 60:02d}"
-
-
-def format_db(value: float, *, signed: bool = True) -> str:
-    """Уровень в дБ; вместо дефиса — настоящий минус."""
-    text = f"{value:+.1f}" if signed else f"{value:.0f}"
-    return text.replace("-", "−") + " дБ"
-
-
-def format_scale(value_db: float) -> str:
-    """Подпись деления шкалы уровня: «−60», «−30», «0»."""
-    if value_db == 0:
-        return "0"
-    return f"{value_db:+.0f}".replace("-", "−")
-
-
-def progress_value_html(duration: str, percent: int) -> str:
-    """Время выделено, процент приглушён: «0:10 · 0%»."""
-    return (
-        f'<span style="color:{COLOR_TEXT}; font-weight:600;">{duration}</span>'
-        f'<span style="color:{COLOR_MUTED};"> · {percent}%</span>'
-    )
-
-
-def level_to_slider(level_db: float) -> int:
-    """Перевести уровень сигнала, дБ, в положение ползунка."""
-    return round(level_db / LEVEL_STEP_DB)
-
-
-def slider_to_level(value: int) -> float:
-    """Перевести положение ползунка в уровень сигнала, дБ."""
-    return value * LEVEL_STEP_DB
