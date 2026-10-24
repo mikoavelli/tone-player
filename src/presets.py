@@ -43,13 +43,19 @@ def _require(settings: Settings, name: str) -> Preset:
     return preset
 
 
-def _aligned_levels(levels: Sequence[float], count: int) -> tuple[float, ...]:
+def aligned_levels(levels: Sequence[float], count: int) -> tuple[float, ...]:
     """Уровни пресета по позициям глобального списка; новые полосы получают 0 дБ."""
     return tuple(levels[index] if index < len(levels) else 0.0 for index in range(count))
 
 
-def save_preset(settings: Settings, name: str, *, overwrite: bool = False) -> Settings:
-    """Сохранить текущие уровни и устройство под именем name и сделать пресет активным.
+def save_preset(
+    settings: Settings,
+    name: str,
+    *,
+    levels: Sequence[float] | None = None,
+    overwrite: bool = False,
+) -> Settings:
+    """Сохранить уровни и устройство под именем name и сделать пресет активным.
 
     Частоты в пресет не входят: список частот общий для всей программы.
     Существующий пресет заменяется только при overwrite=True; он остаётся на
@@ -60,7 +66,8 @@ def save_preset(settings: Settings, name: str, *, overwrite: bool = False) -> Se
     if existing is not None and not overwrite:
         raise PresetError(f"Пресет '{existing.name}' уже существует.")
 
-    preset = Preset(name=name, device=settings.device, levels=settings.levels)
+    preset_levels = tuple(levels) if levels is not None else settings.levels
+    preset = Preset(name=name, device=settings.device, levels=preset_levels)
     if existing is None:
         presets = (*settings.presets, preset)
     else:
@@ -109,7 +116,7 @@ def apply_preset(
     громкость. available_devices — метки устройств, найденных на этом компьютере.
     """
     preset = _require(settings, name)
-    levels = _aligned_levels(preset.levels, len(settings.bands))
+    levels = aligned_levels(preset.levels, len(settings.bands))
     bands = tuple(
         Band(band.frequency_hz, level) for band, level in zip(settings.bands, levels, strict=True)
     )
@@ -125,12 +132,13 @@ def apply_preset(
     )
 
 
-def is_modified(settings: Settings) -> bool:
+def is_modified(settings: Settings, current_levels: Sequence[float] | None = None) -> bool:
     """Отличаются ли текущие уровни или устройство от активного пресета."""
     if settings.active_preset is None:
         return False
     preset = find_preset(settings, settings.active_preset)
     if preset is None:
         return False
-    expected = _aligned_levels(preset.levels, len(settings.bands))
-    return settings.levels != expected or settings.device != preset.device
+    expected = aligned_levels(preset.levels, len(settings.bands))
+    levels = tuple(current_levels) if current_levels is not None else settings.levels
+    return levels != expected or settings.device != preset.device

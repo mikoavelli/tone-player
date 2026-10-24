@@ -83,7 +83,13 @@ from models import (
     Settings,
     ToneConfig,
 )
-from presets import apply_preset, delete_preset, find_preset, save_preset
+from presets import (
+    aligned_levels,
+    apply_preset,
+    delete_preset,
+    find_preset,
+    save_preset,
+)
 from settings_dialog import SettingsDialog
 from settings_store import load_settings, save_settings
 from theme import (
@@ -639,18 +645,38 @@ class MainWindow(QMainWindow):
         stream_factory: StreamFactory | None = None,
     ) -> None:
         super().__init__()
-        self._settings = settings
+        # Инициализация уровней: дефолтный пресет строго 0.0 дБ.
+        # Если активен пользовательский пресет — загружаем его сохранённые уровни.
+        bands_zero = tuple(Band(b.frequency_hz, 0.0) for b in settings.bands)
+        if settings.active_preset is not None:
+            active_p = find_preset(settings, settings.active_preset)
+            if active_p is not None:
+                active_levels = aligned_levels(active_p.levels, len(settings.bands))
+                self._settings = replace(
+                    settings,
+                    bands=tuple(
+                        Band(b.frequency_hz, lvl)
+                        for b, lvl in zip(settings.bands, active_levels, strict=True)
+                    ),
+                )
+            else:
+                active_levels = tuple(0.0 for _ in settings.bands)
+                self._settings = replace(settings, bands=bands_zero, active_preset=None)
+        else:
+            active_levels = tuple(0.0 for _ in settings.bands)
+            self._settings = replace(settings, bands=bands_zero)
+
         self._settings_path = settings_path
         self._settings_file_bytes = self._read_settings_file()
-        self._config = ToneConfig.from_settings(settings)
+        self._config = ToneConfig.from_settings(self._settings)
         self._player = TonePlayer(
             self._config,
-            settings.levels,
-            MASTER_BASE_DB + settings.master_gain_db,
+            active_levels,
+            MASTER_BASE_DB + self._settings.master_gain_db,
             stream_factory=stream_factory,
-            level_scale=settings.level_scale,
+            level_scale=self._settings.level_scale,
         )
-        self._player.set_autoplay(settings.autoplay)
+        self._player.set_autoplay(self._settings.autoplay)
         self._devices: list[OutputDevice] = []
         self._finishing_handled = False
         self._play_button_mode = ""
@@ -1116,11 +1142,12 @@ class MainWindow(QMainWindow):
     def _nudge_active_band(self, direction: int) -> None:
         index = self._player.tone_index
         scale = self._settings.level_scale
-        level = scale.clamp(self._settings.bands[index].level_db + direction * scale.step_db)
-        if level != self._settings.bands[index].level_db:
+        current = self._player.level_at(index)
+        level = scale.clamp(current + direction * scale.step_db)
+        if level != current:
             self._on_band_level(index, level)
-        if self._bands is not None:
-            self._bands.column(index).set_level(level)
+            if self._bands is not None:
+                self._bands.column(index).set_level(level)
 
     def _select_band(self, index: int) -> None:
         """Выбрать полосу; во время звучания новая частота звучит сразу, если включён авторежим."""
@@ -1152,12 +1179,9 @@ class MainWindow(QMainWindow):
         self._refresh()
 
     def _on_band_level(self, index: int, level_db: float) -> None:
+        # Изменение уровня применяется исключительно вживую к звуку.
+        # В файл конфигурации оно не записывается автоматически.
         self._player.set_level_at(index, level_db)
-        bands = tuple(
-            Band(band.frequency_hz, level_db) if number == index else band
-            for number, band in enumerate(self._settings.bands)
-        )
-        self._store(replace(self._settings, bands=bands))
 
     def _on_band_select(self, index: int) -> None:
         self._select_band(index)
@@ -1270,10 +1294,18 @@ class MainWindow(QMainWindow):
     def _on_preset_changed(self, index: int) -> None:
         data = cast("object", self.preset_selector.itemData(index))
         if data is None:
-            if self._settings.active_preset is not None:
-                self._store(replace(self._settings, active_preset=None))
-                self.preset_delete_button.setEnabled(False)
+            # Выбран пресет «По умолчанию» — строго сбрасываем все уровни в 0.0 дБ
+            bands_zero = tuple(Band(b.frequency_hz, 0.0) for b in self._settings.bands)
+            self._settings = replace(self._settings, bands=bands_zero, active_preset=None)
+            self.preset_delete_button.setEnabled(False)
+            for i in range(len(self._settings.bands)):
+                self._player.set_level_at(i, 0.0)
+                if self._bands is not None:
+                    self._bands.column(i).set_level(0.0)
+            self._store(self._settings)
+            self._refresh()
             return
+
         name = str(data)
         available = {device.label for device in self._devices}
         try:
@@ -1344,7 +1376,13 @@ class MainWindow(QMainWindow):
                 if answer != QMessageBox.StandardButton.Yes:
                     return
                 overwrite = True
-            settings = save_preset(self._settings, name, overwrite=overwrite)
+            # Сохраняем уровни только по одобрению пользователя
+            settings = save_preset(
+                self._settings,
+                name,
+                levels=self._player.levels,
+                overwrite=overwrite,
+            )
         except PresetError as error:
             _ = QMessageBox.warning(self, "Пресет не сохранён", str(error))
             return
@@ -1370,7 +1408,14 @@ class MainWindow(QMainWindow):
         except PresetError as error:
             _ = QMessageBox.warning(self, "Пресет не удалён", str(error))
             return
-        self._store(settings)
+        # При удалении пресета сбрасываем всё к дефолту (0.0 дБ)
+        bands_zero = tuple(Band(b.frequency_hz, 0.0) for b in settings.bands)
+        self._settings = replace(settings, bands=bands_zero, active_preset=None)
+        for i in range(len(self._settings.bands)):
+            self._player.set_level_at(i, 0.0)
+            if self._bands is not None:
+                self._bands.column(i).set_level(0.0)
+        self._store(self._settings)
         self._refresh_presets()
         self._refresh()
 

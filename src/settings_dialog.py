@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -38,9 +39,8 @@ from models import (
 from settings_store import validate_settings
 from ui_signals import connect_action
 
-# Одна ширина подписей и полей во всех секциях: поля стоят ровно друг под другом.
+# Ширина подписей одинакова во всех секциях: поля начинаются ровно друг под другом.
 LABEL_WIDTH = 190
-FIELD_WIDTH = 150
 BUTTON_HEIGHT = 34
 
 
@@ -55,7 +55,7 @@ def _form() -> QFormLayout:
     form.setSpacing(8)
     form.setContentsMargins(0, 0, 0, 0)
     form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-    form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+    form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
     return form
 
 
@@ -63,7 +63,7 @@ def _row(form: QFormLayout, text: str, field: QWidget) -> None:
     label = QLabel(text)
     label.setObjectName("fieldLabel")
     label.setFixedWidth(LABEL_WIDTH)
-    field.setFixedWidth(FIELD_WIDTH)
+    field.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     form.addRow(label, field)
 
 

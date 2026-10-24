@@ -11,6 +11,7 @@ import os
 import tempfile
 from collections.abc import Sequence
 from contextlib import suppress
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import cast
@@ -74,6 +75,8 @@ def preset_name_problem(name: str) -> str | None:
         return f"Имя пресета длиннее {MAX_PRESET_NAME_LENGTH} символов."
     if any(not char.isprintable() for char in name):
         return "Имя пресета содержит непечатаемые символы."
+    if name.casefold() in ("default", "по умолчанию"):
+        return "Имя «По умолчанию» зарезервировано."
     return None
 
 
@@ -413,7 +416,8 @@ def settings_to_data(settings: Settings) -> dict[str, object]:
     """Представление настроек для JSON; порядок ключей фиксирован."""
 
     def bands_data(bands: Sequence[Band]) -> list[object]:
-        return [{"frequency_hz": band.frequency_hz, "level_db": band.level_db} for band in bands]
+        # В bands уровни всегда равны 0.0: уровни хранятся исключительно в пресетах
+        return [{"frequency_hz": band.frequency_hz, "level_db": 0.0} for band in bands]
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -486,14 +490,18 @@ def save_settings(path: Path, settings: Settings) -> None:
     Данные проверяются до записи и сверяются после сериализации, поэтому
     некорректное состояние не попадает в файл.
     """
+    # В сохранённом файле полосы всегда имеют нулевой уровень
+    normalized_bands = tuple(Band(b.frequency_hz, 0.0) for b in settings.bands)
+    settings_to_save = replace(settings, bands=normalized_bands)
+
     try:
-        validate_settings(settings)
+        validate_settings(settings_to_save)
     except SettingsFormatError as err:
         raise SettingsSaveError(f"Настройки не записаны: {err}") from err
 
-    text = settings_to_text(settings)
+    text = settings_to_text(settings_to_save)
     try:
-        if parse_settings(cast("object", json.loads(text))) != settings:
+        if parse_settings(cast("object", json.loads(text))) != settings_to_save:
             raise SettingsSaveError("Настройки не записаны: результат не совпал с исходными.")
     except SettingsFormatError as err:
         raise SettingsSaveError(f"Настройки не записаны: {err}") from err
