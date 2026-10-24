@@ -499,7 +499,6 @@ def _draw_glyph(kind: str, size: int, color: str) -> QPixmap:
         glyph = "start" if kind == "bandStart" else "pause" if kind == "bandPause" else kind
         painter.setBrush(qcolor)
         if glyph == "start":
-            # Контур того же цвета скругляет углы треугольника.
             painter.setPen(
                 QPen(
                     qcolor,
@@ -554,7 +553,6 @@ class ToggleSwitch(QAbstractButton):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setCheckable(True)
-        # Фокус только с клавиатуры: после щелчка мышью кольцо не остаётся.
         self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedSize(self._TRACK_WIDTH + 2 * self._RING, self._TRACK_HEIGHT + 2 * self._RING)
@@ -666,6 +664,7 @@ class MainWindow(QMainWindow):
             active_levels = tuple(0.0 for _ in settings.bands)
             self._settings = replace(settings, bands=bands_zero)
 
+        self._focused_index = 0
         self._settings_path = settings_path
         self._settings_file_bytes = self._read_settings_file()
         self._config = ToneConfig.from_settings(self._settings)
@@ -960,8 +959,6 @@ class MainWindow(QMainWindow):
         self._band_scroll = BandScrollArea()
         grid.addWidget(self._band_scroll, 0, 2)
 
-        # Полоса прокрутки — отдельный виджет в своей строке, поэтому она не
-        # отнимает высоту у колонок и мастер выровнен с ними.
         self._band_bar = QScrollBar(Qt.Orientation.Horizontal)
         self._band_bar.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         inner = self._band_scroll.horizontalScrollBar()
@@ -987,8 +984,6 @@ class MainWindow(QMainWindow):
         self._band_bar.setValue(inner.value())
 
     def _build_master(self) -> QWidget:
-        # Устроен как лента полос: шкала слева, рядом колонка той же ширины и
-        # с теми же отступами, что у полосы.
         box = QWidget()
         box.setObjectName("masterBox")
         row = QHBoxLayout(box)
@@ -1050,6 +1045,7 @@ class MainWindow(QMainWindow):
             on_level=self._on_band_level,
             on_play=self._on_band_play,
             on_select=self._on_band_select,
+            on_activate=self._on_activate_band,
             on_navigate=self._navigate,
             on_scroll=self._scroll_bands,
         )
@@ -1060,12 +1056,31 @@ class MainWindow(QMainWindow):
         if focused_index is not None:
             index = min(focused_index, len(self._settings.bands) - 1)
         else:
-            index = min(self._player.tone_index, len(self._settings.bands) - 1)
+            index = min(self._focused_index, len(self._settings.bands) - 1)
+        self._focused_index = index
         strip.column(index).slider.setFocus()
 
     # -------------------------------------------------------------------------
     # Обработчики
     # -------------------------------------------------------------------------
+
+    def _get_focused_band_index(self) -> int:
+        """Индекс полосы, чей ползунок выбран в данный момент."""
+        if self._bands is not None:
+            focus = QApplication.focusWidget()
+            for i in range(len(self._settings.bands)):
+                if focus is self._bands.column(i).slider:
+                    self._focused_index = i
+                    return i
+        return min(max(self._focused_index, 0), len(self._settings.bands) - 1)
+
+    def _is_any_band_slider_focused(self) -> bool:
+        if self._bands is not None:
+            focus = QApplication.focusWidget()
+            for i in range(len(self._settings.bands)):
+                if focus is self._bands.column(i).slider:
+                    return True
+        return False
 
     def _on_play_pause(self) -> None:
         """Главная кнопка: запуск, пауза или продолжение — по состоянию проигрывателя."""
@@ -1077,7 +1092,7 @@ class MainWindow(QMainWindow):
             self._player.resume()
             self._refresh()
         else:
-            index = 0 if state is PlayerState.FINISHED else self._player.tone_index
+            index = 0 if state is PlayerState.FINISHED else self._get_focused_band_index()
             self._start_playback(index)
 
     def _on_autoplay_toggled(self, enabled: bool) -> None:
@@ -1114,24 +1129,36 @@ class MainWindow(QMainWindow):
                 self._on_play_pause()
                 a0.accept()
                 return
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self._on_activate_current()
+                a0.accept()
+                return
         super().keyPressEvent(a0)
 
     def _navigate(self, offset: int) -> None:
+        """Переместить фокус (кругляш) между полосами без переключения звука."""
         if self.master_slider.hasFocus():
             if offset > 0:
-                self._focus_band(self._player.tone_index)
+                self._focus_band(self._focused_index)
             return
-        if offset < 0 and self._player.tone_index == 0:
+
+        current = self._get_focused_band_index()
+        if offset < 0 and current == 0:
             focus = QApplication.focusWidget()
             first_slider = self._bands.column(0).slider if self._bands is not None else None
             if focus is self or focus is first_slider:
                 self.master_slider.setFocus()
                 return
-        index = min(max(self._player.tone_index + offset, 0), self._config.tone_count - 1)
-        self._select_band(index)
+
+        new_index = min(max(current + offset, 0), len(self._settings.bands) - 1)
+        self._focused_index = new_index
+        self._focus_band(new_index)
+        if self._bands is not None:
+            self._band_scroll.ensureWidgetVisible(self._bands.column(new_index), 48, 0)
 
     def _focus_band(self, index: int) -> None:
         if self._bands is not None:
+            self._focused_index = index
             self._bands.column(index).slider.setFocus()
 
     def _scroll_bands(self, delta: int) -> None:
@@ -1140,7 +1167,8 @@ class MainWindow(QMainWindow):
             bar.setValue(bar.value() - delta)
 
     def _nudge_active_band(self, direction: int) -> None:
-        index = self._player.tone_index
+        """Изменить уровень той полосы, чей кругляш сейчас в фокусе."""
+        index = self._get_focused_band_index()
         scale = self._settings.level_scale
         current = self._player.level_at(index)
         level = scale.clamp(current + direction * scale.step_db)
@@ -1149,19 +1177,25 @@ class MainWindow(QMainWindow):
             if self._bands is not None:
                 self._bands.column(index).set_level(level)
 
-    def _select_band(self, index: int) -> None:
-        """Выбрать полосу; во время звучания новая частота звучит сразу, если включён авторежим."""
-        if index == self._player.tone_index and self._player.state is not PlayerState.FINISHED:
-            self._focus_band(index)
+    def _on_activate_current(self) -> None:
+        """Enter на текущем элементе: направить воспроизведение на полосу в фокусе."""
+        if self.master_slider.hasFocus():
             return
-        if self._player.state is PlayerState.PLAYING and self._settings.autoplay:
+        index = self._get_focused_band_index()
+        self._on_activate_band(index)
+
+    def _on_activate_band(self, index: int) -> None:
+        """Активировать полосу: сброс/старт воспроизведения с 0:00 без смены общего состояния."""
+        state = self._player.state
+        if state is PlayerState.PLAYING:
+            # Звук идёт: сразу воспроизводим выбранную полосу с начала (или перезапускаем текущую)
             self._start_playback(index)
-            self._focus_band(index)
             return
+
+        # Звук не идёт (PAUSED, IDLE, FINISHED): назначаем полосу, сбрасываем тон, но звук не включаем
         self._player.select(index)
         self._finishing_handled = False
         self._refresh()
-        self._focus_band(index)
 
     def _start_playback(self, index: int) -> None:
         """Запустить воспроизведение с тона index, показав ошибку устройства."""
@@ -1184,9 +1218,12 @@ class MainWindow(QMainWindow):
         self._player.set_level_at(index, level_db)
 
     def _on_band_select(self, index: int) -> None:
-        self._select_band(index)
+        """Клик по полосе: переводит фокус кругляша на неё без срыва текущего звука."""
+        self._focused_index = index
+        self._focus_band(index)
 
     def _on_band_play(self, index: int) -> None:
+        """Клик по кнопке ▶ под полосой: прямое управление воспроизведением этой частоты."""
         self._focus_band(index)
         state = self._player.state
         if index == self._player.tone_index:
@@ -1273,10 +1310,7 @@ class MainWindow(QMainWindow):
         self.master_value_label.setText(format_db(self._settings.master_gain_db, unit=False))
 
     def _on_focus_changed(self, _old: QWidget | None, new: QWidget | None) -> None:
-        master_focused = new is self.master_slider
-        self._master_frame.set_focused(master_focused)
-        if self._bands is not None:
-            self._bands.set_master_focused(master_focused)
+        pass
 
     def _refresh_presets(self) -> None:
         self.preset_selector.blockSignals(True)
@@ -1294,7 +1328,6 @@ class MainWindow(QMainWindow):
     def _on_preset_changed(self, index: int) -> None:
         data = cast("object", self.preset_selector.itemData(index))
         if data is None:
-            # Выбран пресет «По умолчанию» — строго сбрасываем все уровни в 0.0 дБ
             bands_zero = tuple(Band(b.frequency_hz, 0.0) for b in self._settings.bands)
             self._settings = replace(self._settings, bands=bands_zero, active_preset=None)
             self.preset_delete_button.setEnabled(False)
@@ -1376,7 +1409,6 @@ class MainWindow(QMainWindow):
                 if answer != QMessageBox.StandardButton.Yes:
                     return
                 overwrite = True
-            # Сохраняем уровни только по одобрению пользователя
             settings = save_preset(
                 self._settings,
                 name,
@@ -1408,7 +1440,6 @@ class MainWindow(QMainWindow):
         except PresetError as error:
             _ = QMessageBox.warning(self, "Пресет не удалён", str(error))
             return
-        # При удалении пресета сбрасываем всё к дефолту (0.0 дБ)
         bands_zero = tuple(Band(b.frequency_hz, 0.0) for b in settings.bands)
         self._settings = replace(settings, bands=bands_zero, active_preset=None)
         for i in range(len(self._settings.bands)):
@@ -1447,7 +1478,6 @@ class MainWindow(QMainWindow):
     def _on_settings_file_changed(self, path: str) -> None:
         if Path(path) != self._settings_path:
             return
-        # Редакторы часто заменяют файл целиком; после этого наблюдение нужно вернуть.
         _ = self._settings_watcher.addPath(str(self._settings_path))
         self._reload_timer.start()
 
@@ -1526,9 +1556,12 @@ class MainWindow(QMainWindow):
             self._bands.set_current(progress.tone_index, state is PlayerState.PLAYING)
             if progress.tone_index != self._last_band_index:
                 self._last_band_index = progress.tone_index
-                self._band_scroll.ensureWidgetVisible(
-                    self._bands.column(progress.tone_index), 48, 0
-                )
+                # Автоскролл подстраивается под играющую частоту только если пользователь не настраивает другую полосу
+                focused_idx = self._get_focused_band_index()
+                if focused_idx == progress.tone_index or not self._is_any_band_slider_focused():
+                    self._band_scroll.ensureWidgetVisible(
+                        self._bands.column(progress.tone_index), 48, 0
+                    )
 
         self.master_value_label.setText(
             format_db(self._player.master_db - MASTER_BASE_DB, unit=False)

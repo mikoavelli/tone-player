@@ -35,6 +35,8 @@ ignore-names = [
     "closeEvent",
     "setUp",
     "setUpClass",
+    "focusInEvent",
+    "focusOutEvent",
 ]
 
 [tool.basedpyright]

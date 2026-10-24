@@ -7,6 +7,7 @@ from PyQt6.QtGui import (
     QColor,
     QContextMenuEvent,
     QEnterEvent,
+    QFocusEvent,
     QFont,
     QIcon,
     QKeyEvent,
@@ -39,7 +40,7 @@ from theme import (
     COLOR_SURFACE_HOVER,
     COLOR_TEXT,
 )
-from ui_signals import connect_action, connect_index
+from ui_signals import connect_action, connect_index, connect_toggle
 from ui_text import format_db, format_frequency_value, format_scale
 
 COLUMN_WIDTH = 66
@@ -72,7 +73,7 @@ def track_y(position: int, maximum: int, height: int) -> float:
 
 
 def paint_column_frame(widget: QWidget, *, accent: bool) -> None:
-    """Нарисовать рамку выбранной колонки; accent — яркая рамка (звучит или в фокусе)."""
+    """Нарисовать рамку колонки; accent — яркая рамка воспроизведения."""
     painter = QPainter(widget)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     painter.setBrush(QColor(COLOR_SURFACE_HOVER if accent else COLOR_SURFACE))
@@ -88,6 +89,8 @@ class LevelSlider(QSlider):
 
     navigate_requested = pyqtSignal(int)
     scroll_requested = pyqtSignal(int)
+    activate_requested = pyqtSignal()
+    focus_changed = pyqtSignal(bool)
 
     def __init__(self, scale: LevelScale, parent: QWidget | None = None) -> None:
         super().__init__(Qt.Orientation.Vertical, parent)
@@ -153,7 +156,7 @@ class LevelSlider(QSlider):
         painter.drawLine(QPointF(8.0, y), QPointF(self.width() - 8.0, y))
         painter.restore()
 
-        # Фокус с клавиатуры: светлое кольцо внутри ручки, размер ручки не меняется.
+        # Фокус с клавиатуры: светлое кольцо внутри кругляша (ручки).
         if self.hasFocus() and not handle.isNull():
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setPen(QPen(QColor(COLOR_TEXT), 2))
@@ -175,6 +178,10 @@ class LevelSlider(QSlider):
             self.navigate_requested.emit(-1 if ev.key() == Qt.Key.Key_Left else 1)
             ev.accept()
             return
+        if ev is not None and ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.activate_requested.emit()
+            ev.accept()
+            return
         super().keyPressEvent(ev)
 
     def wheelEvent(self, e: QWheelEvent | None) -> None:
@@ -182,6 +189,14 @@ class LevelSlider(QSlider):
             return
         self.scroll_requested.emit(wheel_scroll_delta(e))
         e.accept()
+
+    def focusInEvent(self, a0: QFocusEvent | None) -> None:
+        super().focusInEvent(a0)
+        self.focus_changed.emit(True)
+
+    def focusOutEvent(self, a0: QFocusEvent | None) -> None:
+        super().focusOutEvent(a0)
+        self.focus_changed.emit(False)
 
 
 class LevelRuler(QWidget):
@@ -215,8 +230,6 @@ class LevelRuler(QWidget):
             (self._scale.position(self._scale.min_db), format_scale(self._scale.min_db)),
         )
         if self._slider is not None:
-            # Деления ставятся по центрам ручки, а не по краям дорожки: так черта и
-            # подпись совпадают с ручкой в крайних положениях.
             slider_top = self._slider.mapToGlobal(QPoint(0, 0)).y()
             ruler_top = self.mapToGlobal(QPoint(0, 0)).y()
             top = float(slider_top - ruler_top)
@@ -241,7 +254,7 @@ class LevelRuler(QWidget):
 
 
 class MasterFrame(QWidget):
-    """Колонка общей громкости: той же ширины и с той же рамкой, что у выбранной полосы."""
+    """Колонка общей громкости: той же ширины и с той же рамкой, что у полосы."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -253,11 +266,6 @@ class MasterFrame(QWidget):
         if self._focused != focused:
             self._focused = focused
             self.update()
-
-    def paintEvent(self, a0: QPaintEvent | None) -> None:
-        if self._focused:
-            paint_column_frame(self, accent=False)
-        super().paintEvent(a0)
 
 
 class BandColumn(QWidget):
@@ -273,6 +281,7 @@ class BandColumn(QWidget):
         on_level: Callable[[int, float], None],
         on_play: Callable[[int], None],
         on_select: Callable[[int], None],
+        on_activate: Callable[[int], None],
         on_navigate: Callable[[int], None],
         on_scroll: Callable[[int], None],
         parent: QWidget | None = None,
@@ -283,6 +292,7 @@ class BandColumn(QWidget):
         self._on_level = on_level
         self._on_play = on_play
         self._on_select = on_select
+        self._on_activate_action = on_activate
         self._on_navigate = on_navigate
         self._on_scroll = on_scroll
         self._icons = icons
@@ -315,6 +325,8 @@ class BandColumn(QWidget):
         connect_action(self.slider.sliderReleased, self._on_slider_released)
         connect_index(self.slider.navigate_requested, self._on_navigate)
         connect_index(self.slider.scroll_requested, self._on_scroll)
+        connect_action(self.slider.activate_requested, self._on_slider_activate)
+        connect_toggle(self.slider.focus_changed, self._on_slider_focus_changed)
         layout.addWidget(self.slider, 1)
 
         self.frequency_label = QLabel(format_frequency_value(band.frequency_hz))
@@ -349,6 +361,7 @@ class BandColumn(QWidget):
         self._update_text()
 
     def set_current(self, current: bool, playing: bool) -> None:
+        """current — колонка воспроизводится; playing — активный звук."""
         if (current, playing) == (self._current, self._playing):
             return
         self._current = current
@@ -372,7 +385,7 @@ class BandColumn(QWidget):
         return self._scale.at_position(self.slider.value())
 
     def _update_text(self) -> None:
-        visible = self._current or self._hover or self._editing
+        visible = self._current or self.slider.hasFocus() or self._hover or self._editing
         self.value_label.setText(format_db(self._level(), unit=False) if visible else "")
         self._update_tooltip()
 
@@ -380,7 +393,8 @@ class BandColumn(QWidget):
         text = (
             f"{self.frequency_label.text()} Гц\n"
             f"Уровень: {format_db(self._level())}\n"
-            "↑ ↓ — изменить, ← → — частота, Пробел — пауза\n"
+            "↑ ↓ — изменить, ← → — выбор ползунка\n"
+            "Enter — включить воспроизведение, Пробел — пауза\n"
             "Двойной щелчок или правая кнопка — сбросить в 0 дБ"
         )
         self.setToolTip(text)
@@ -398,6 +412,12 @@ class BandColumn(QWidget):
 
     def _on_slider_released(self) -> None:
         self._editing = False
+        self._update_text()
+
+    def _on_slider_activate(self) -> None:
+        self._on_activate_action(self._index)
+
+    def _on_slider_focus_changed(self, _focused: bool) -> None:
         self._update_text()
 
     def _on_play_clicked(self) -> None:
@@ -426,7 +446,8 @@ class BandColumn(QWidget):
         super().leaveEvent(a0)
 
     def paintEvent(self, a0: QPaintEvent | None) -> None:
-        if self._current and not self._master_focused:
+        # Рамка рисуется исключительно вокруг воспроизводимой частоты
+        if self._current:
             paint_column_frame(self, accent=self._playing)
         super().paintEvent(a0)
 
@@ -442,6 +463,7 @@ class BandStrip(QWidget):
         on_level: Callable[[int, float], None],
         on_play: Callable[[int], None],
         on_select: Callable[[int], None],
+        on_activate: Callable[[int], None],
         on_navigate: Callable[[int], None],
         on_scroll: Callable[[int], None],
         parent: QWidget | None = None,
@@ -452,10 +474,10 @@ class BandStrip(QWidget):
         self._on_level = on_level
         self._on_play = on_play
         self._on_select = on_select
+        self._on_activate = on_activate
         self._on_navigate = on_navigate
         self._on_scroll = on_scroll
         self._layout = QHBoxLayout(self)
-        # Вертикальных полей нет: колонки начинаются на той же высоте, что и мастер.
         self._layout.setContentsMargins(4, 0, 8, 0)
         self._layout.setSpacing(RULER_SPACING)
         self._columns: list[BandColumn] = []
@@ -480,6 +502,7 @@ class BandStrip(QWidget):
                 on_level=self._on_level,
                 on_play=self._on_play,
                 on_select=self._on_select,
+                on_activate=self._on_activate,
                 on_navigate=self._on_navigate,
                 on_scroll=self._on_scroll,
             )
