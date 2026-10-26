@@ -37,14 +37,17 @@ class TestSave(unittest.TestCase):
     def test_saves_current_levels_and_device_and_activates(self) -> None:
         settings = save_preset(make_settings(), "Дом")
 
-        self.assertEqual(settings.presets, (Preset("Дом", "Speakers [MME]", (0.0, 1.0, -2.5)),))
+        self.assertEqual(
+            settings.presets, (Preset("Дом", "Speakers [MME]", bands(0.0, 1.0, -2.5)),)
+        )
         self.assertEqual(settings.active_preset, "Дом")
         validate_settings(settings)
 
-    def test_preset_does_not_contain_frequency_list(self) -> None:
+    def test_preset_contains_bands(self) -> None:
         preset = save_preset(make_settings(), "Дом").presets[0]
 
-        self.assertFalse(hasattr(preset, "bands"))
+        self.assertTrue(hasattr(preset, "bands"))
+        self.assertEqual(preset.bands, bands(0.0, 1.0, -2.5))
         self.assertEqual(preset.levels, (0.0, 1.0, -2.5))
 
     def test_default_device_is_stored_as_none(self) -> None:
@@ -70,10 +73,9 @@ class TestSave(unittest.TestCase):
 
         again = save_preset(changed, "дом", overwrite=True)
         self.assertEqual(len(again.presets), 1)
-        # Имя сохраняется в том виде, в каком его ввели.
         self.assertEqual(again.presets[0].name, "дом")
         self.assertEqual(again.active_preset, "дом")
-        self.assertEqual(again.presets[0].levels, (3.0, 3.0, 3.0))
+        self.assertEqual(again.presets[0].bands, bands(3.0, 3.0, 3.0))
         validate_settings(again)
 
     def test_overwrite_keeps_position(self) -> None:
@@ -85,7 +87,7 @@ class TestSave(unittest.TestCase):
         self.assertEqual(again.active_preset, "А")
 
     def test_bad_names(self) -> None:
-        for name in ("", "   ", "x" * 65, "a\nb"):
+        for name in ("", "   ", "x" * 65, "a\nb", "default", "По умолчанию"):
             with self.subTest(name=name), self.assertRaises(PresetError):
                 _ = save_preset(make_settings(), name)
 
@@ -100,7 +102,7 @@ class TestApply(unittest.TestCase):
         saved = save_preset(make_settings(device="USB [WASAPI]"), "USB")
         self.settings = replace(saved, bands=bands(0.0, 0.0, 0.0), device=None)
 
-    def test_replaces_levels_and_device(self) -> None:
+    def test_replaces_bands_and_device(self) -> None:
         result = apply_preset(self.settings, "usb", ["USB [WASAPI]"])
 
         self.assertEqual(result.settings.bands, bands(0.0, 1.0, -2.5))
@@ -135,32 +137,13 @@ class TestApply(unittest.TestCase):
         with self.assertRaises(PresetError):
             _ = apply_preset(self.settings, "нет", [])
 
-    def test_apply_uses_current_global_frequencies(self) -> None:
-        settings = replace(
-            self.settings,
-            bands=(Band(400.0, 0.0), Band(800.0, 0.0), Band(1200.0, 0.0)),
-        )
+    def test_apply_uses_preset_own_frequencies_and_count(self) -> None:
+        custom_bands = (Band(400.0, 1.0), Band(800.0, -1.0))
+        settings = save_preset(replace(self.settings, bands=custom_bands), "Custom", overwrite=True)
 
-        result = apply_preset(settings, "USB", ["USB [WASAPI]"])
+        result = apply_preset(settings, "Custom", ["USB [WASAPI]"])
 
-        self.assertEqual(
-            result.settings.bands,
-            (Band(400.0, 0.0), Band(800.0, 1.0), Band(1200.0, -2.5)),
-        )
-
-    def test_new_global_bands_get_zero_level(self) -> None:
-        settings = replace(self.settings, bands=bands(0.0, 0.0, 0.0, 0.0, 0.0))
-
-        result = apply_preset(settings, "USB", ["USB [WASAPI]"])
-
-        self.assertEqual(result.settings.levels, (0.0, 1.0, -2.5, 0.0, 0.0))
-
-    def test_extra_saved_levels_are_ignored(self) -> None:
-        settings = replace(self.settings, bands=bands(0.0, 0.0))
-
-        result = apply_preset(settings, "USB", ["USB [WASAPI]"])
-
-        self.assertEqual(result.settings.levels, (0.0, 1.0))
+        self.assertEqual(result.settings.bands, custom_bands)
 
 
 class TestRenameAndDelete(unittest.TestCase):
@@ -192,12 +175,11 @@ class TestRenameAndDelete(unittest.TestCase):
         with self.assertRaises(PresetError):
             _ = rename_preset(self.settings, "нет", "Д")
 
-    def test_delete_keeps_current_bands(self) -> None:
+    def test_delete_resets_active_to_none(self) -> None:
         result = delete_preset(self.settings, "Б")
 
         self.assertEqual([item.name for item in result.presets], ["А"])
         self.assertIsNone(result.active_preset)
-        self.assertEqual(result.bands, self.settings.bands)
         validate_settings(result)
 
     def test_delete_inactive_keeps_active(self) -> None:
@@ -229,20 +211,6 @@ class TestModified(unittest.TestCase):
         saved = save_preset(make_settings(), "Дом")
 
         self.assertFalse(is_modified(replace(saved, master_gain_db=-6.0)))
-
-    def test_changed_global_frequencies_do_not_mark_modified(self) -> None:
-        saved = save_preset(make_settings(), "Дом")
-        changed = replace(
-            saved,
-            bands=(Band(400.0, 0.0), Band(800.0, 1.0), Band(1200.0, -2.5)),
-        )
-
-        self.assertFalse(is_modified(changed))
-
-    def test_extra_global_bands_with_zero_levels_are_not_modified(self) -> None:
-        saved = save_preset(make_settings(), "Дом")
-
-        self.assertFalse(is_modified(replace(saved, bands=bands(0.0, 1.0, -2.5, 0.0, 0.0))))
 
 
 if __name__ == "__main__":

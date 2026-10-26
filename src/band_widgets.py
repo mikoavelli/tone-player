@@ -49,10 +49,8 @@ COLUMN_FREQUENCY_HEIGHT = 18
 COLUMN_PLAY_SIZE = 28
 COLUMN_SPACING = 6
 COLUMN_MARGIN = 4
-# Ползунок внутри колонки: ширина колонки минус поля по бокам.
 SLIDER_WIDTH = COLUMN_WIDTH - 2 * COLUMN_MARGIN
 RULER_WIDTH = 40
-# Промежуток между шкалой и колонкой: одинаковый в ленте полос и у мастера.
 RULER_SPACING = 4
 FRAME_RADIUS = 10
 
@@ -145,7 +143,6 @@ class LevelSlider(QSlider):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         handle = self.handle_rect()
 
-        # Черта нуля не должна просвечивать сквозь ручку.
         painter.save()
         if not handle.isNull():
             painter.setClipRegion(
@@ -156,7 +153,6 @@ class LevelSlider(QSlider):
         painter.drawLine(QPointF(8.0, y), QPointF(self.width() - 8.0, y))
         painter.restore()
 
-        # Фокус с клавиатуры: светлое кольцо внутри кругляша (ручки).
         if self.hasFocus() and not handle.isNull():
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setPen(QPen(QColor(COLOR_TEXT), 2))
@@ -254,18 +250,15 @@ class LevelRuler(QWidget):
 
 
 class MasterFrame(QWidget):
-    """Колонка общей громкости: той же ширины и с той же рамкой, что у полосы."""
+    """Колонка общей громкости: той же ширины, что и полосы."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._focused = False
         self.setFixedWidth(COLUMN_WIDTH)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
 
     def set_focused(self, focused: bool) -> None:
-        if self._focused != focused:
-            self._focused = focused
-            self.update()
+        pass
 
 
 class BandColumn(QWidget):
@@ -300,7 +293,6 @@ class BandColumn(QWidget):
         self._playing = False
         self._hover = False
         self._editing = False
-        self._master_focused = False
 
         self.setFixedWidth(COLUMN_WIDTH)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
@@ -372,9 +364,7 @@ class BandColumn(QWidget):
         self.update()
 
     def set_master_focused(self, focused: bool) -> None:
-        if self._master_focused != focused:
-            self._master_focused = focused
-            self.update()
+        pass
 
     def set_scale(self, scale: LevelScale) -> None:
         self._scale = scale
@@ -446,7 +436,6 @@ class BandColumn(QWidget):
         super().leaveEvent(a0)
 
     def paintEvent(self, a0: QPaintEvent | None) -> None:
-        # Рамка рисуется исключительно вокруг воспроизводимой частоты
         if self._current:
             paint_column_frame(self, accent=self._playing)
         super().paintEvent(a0)
@@ -481,11 +470,15 @@ class BandStrip(QWidget):
         self._layout.setContentsMargins(4, 0, 8, 0)
         self._layout.setSpacing(RULER_SPACING)
         self._columns: list[BandColumn] = []
-        self._master_focused = False
         self._ruler = LevelRuler(scale)
         self._layout.addWidget(self._ruler)
         self._layout.addStretch(1)
         self.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding)
+
+    @property
+    def count(self) -> int:
+        """Точное число колонок в ленте."""
+        return len(self._columns)
 
     def set_bands(self, bands: Sequence[Band], scale: LevelScale) -> None:
         """Перестроить колонки под новый набор полос."""
@@ -506,7 +499,6 @@ class BandStrip(QWidget):
                 on_navigate=self._on_navigate,
                 on_scroll=self._on_scroll,
             )
-            column.set_master_focused(self._master_focused)
             self._columns.append(column)
             self._layout.addWidget(column)
         if self._columns:
@@ -516,13 +508,9 @@ class BandStrip(QWidget):
     def set_current(self, index: int, playing: bool) -> None:
         for number, column in enumerate(self._columns):
             column.set_current(number == index, playing and number == index)
-            column.set_master_focused(self._master_focused)
 
     def set_master_focused(self, focused: bool) -> None:
-        if self._master_focused != focused:
-            self._master_focused = focused
-            for column in self._columns:
-                column.set_master_focused(focused)
+        pass
 
     def set_scale(self, scale: LevelScale) -> None:
         self._scale = scale

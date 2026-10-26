@@ -37,6 +37,33 @@
     {"frequency_hz": 9500.0, "level_db": 0.0},
     {"frequency_hz": 10000.0, "level_db": 0.0}
   ],
-  "presets": [],
+  "presets": [
+    {
+      "name": "New",
+      "device": "default",
+      "bands": [
+        {"frequency_hz": 500.0, "level_db": 1.0},
+        {"frequency_hz": 1000.0, "level_db": 0.5},
+        {"frequency_hz": 1500.0, "level_db": 1.5},
+        {"frequency_hz": 2000.0, "level_db": 0.5},
+        {"frequency_hz": 2500.0, "level_db": 0.5},
+        {"frequency_hz": 3000.0, "level_db": 0.0},
+        {"frequency_hz": 3500.0, "level_db": 0.5},
+        {"frequency_hz": 4000.0, "level_db": 0.0},
+        {"frequency_hz": 4500.0, "level_db": 0.0},
+        {"frequency_hz": 5000.0, "level_db": 0.5},
+        {"frequency_hz": 5500.0, "level_db": 0.5},
+        {"frequency_hz": 6000.0, "level_db": 2.0},
+        {"frequency_hz": 6500.0, "level_db": 0.5},
+        {"frequency_hz": 7000.0, "level_db": 0.0},
+        {"frequency_hz": 7500.0, "level_db": 0.0},
+        {"frequency_hz": 8000.0, "level_db": 1.0},
+        {"frequency_hz": 8500.0, "level_db": 0.5},
+        {"frequency_hz": 9000.0, "level_db": 0.5},
+        {"frequency_hz": 9500.0, "level_db": 0.0},
+        {"frequency_hz": 10000.0, "level_db": -0.5}
+      ]
+    }
+  ],
   "active_preset": "default"
 }

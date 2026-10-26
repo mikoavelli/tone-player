@@ -57,7 +57,7 @@ _PLAYBACK_KEYS = frozenset({"seconds_per_tone", "sample_rate", "fade_ms", "autop
 _OUTPUT_KEYS = frozenset({"device", "master_gain_db"})
 _LEVELS_KEYS = frozenset({"min_db", "max_db", "step_db"})
 _BAND_KEYS = frozenset({"frequency_hz", "level_db"})
-_PRESET_KEYS = frozenset({"name", "device", "levels"})
+_PRESET_KEYS = frozenset({"name", "device", "bands"})
 
 
 # -----------------------------------------------------------------------------
@@ -196,6 +196,14 @@ def validate_settings(settings: Settings) -> None:
         scale=scale,
     )
 
+    if settings.default_bands:
+        validate_bands(
+            settings.default_bands,
+            max_frequency_hz=nyquist_hz(settings.sample_rate),
+            what="Полосы по умолчанию",
+            scale=scale,
+        )
+
     names: set[str] = set()
     for preset in settings.presets:
         problem = preset_name_problem(preset.name)
@@ -206,12 +214,12 @@ def validate_settings(settings: Settings) -> None:
             raise SettingsFormatError(f"Пресет '{preset.name}' встречается дважды.")
         names.add(key)
         _validate_device(preset.device, f"Пресет '{preset.name}'")
-        if not 1 <= len(preset.levels) <= MAX_BANDS:
-            raise SettingsFormatError(
-                f"Пресет '{preset.name}': число уровней должно быть от 1 до {MAX_BANDS}."
-            )
-        for number, level in enumerate(preset.levels, start=1):
-            _validate_level(level, scale, f"Пресет '{preset.name}': уровень {number}")
+        validate_bands(
+            preset.bands,
+            max_frequency_hz=nyquist_hz(settings.sample_rate),
+            what=f"Пресет '{preset.name}'",
+            scale=scale,
+        )
 
     if settings.active_preset is not None and settings.active_preset.casefold() not in names:
         raise SettingsFormatError(
@@ -324,13 +332,6 @@ def _parse_bands(value: object, what: str) -> tuple[Band, ...]:
     return tuple(bands)
 
 
-def _parse_levels(value: object, what: str) -> tuple[float, ...]:
-    levels: list[float] = []
-    for number, item in enumerate(_as_list(value, what), start=1):
-        levels.append(_as_number(item, f"{what}[{number}]"))
-    return tuple(levels)
-
-
 def parse_settings(raw: object) -> Settings:
     """Построить и проверить настройки по разобранному JSON."""
     root = _as_object(raw, "Файл")
@@ -360,9 +361,20 @@ def parse_settings(raw: object) -> Settings:
             Preset(
                 name=_as_text(data["name"], f"{label}.name"),
                 device=_as_device(data["device"], f"{label}.device"),
-                levels=_parse_levels(data["levels"], f"{label}.levels"),
+                bands=_parse_bands(data["bands"], f"{label}.bands"),
             )
         )
+
+    active = _as_active_preset(root["active_preset"], "active_preset")
+    root_bands = _parse_bands(root["bands"], "bands")
+    default_bands = tuple(Band(b.frequency_hz, 0.0) for b in root_bands)
+
+    active_bands = default_bands
+    if active is not None:
+        for p in presets:
+            if p.name.casefold() == active.casefold():
+                active_bands = p.bands
+                break
 
     settings = Settings(
         seconds_per_tone=_as_number(playback["seconds_per_tone"], "playback.seconds_per_tone"),
@@ -370,15 +382,16 @@ def parse_settings(raw: object) -> Settings:
         fade_ms=_as_number(playback["fade_ms"], "playback.fade_ms"),
         master_gain_db=_as_number(output["master_gain_db"], "output.master_gain_db"),
         device=_as_device(output["device"], "output.device"),
-        bands=_parse_bands(root["bands"], "bands"),
+        bands=active_bands,
         presets=tuple(presets),
-        active_preset=_as_active_preset(root["active_preset"], "active_preset"),
+        active_preset=active,
         level_scale=LevelScale(
             min_db=_as_number(levels["min_db"], "levels.min_db"),
             max_db=_as_number(levels["max_db"], "levels.max_db"),
             step_db=_as_number(levels["step_db"], "levels.step_db"),
         ),
         autoplay=_as_bool(playback["autoplay"], "playback.autoplay"),
+        default_bands=default_bands,
     )
     validate_settings(settings)
     return settings
@@ -416,7 +429,6 @@ def settings_to_data(settings: Settings) -> dict[str, object]:
     """Представление настроек для JSON; порядок ключей фиксирован."""
 
     def bands_data(bands: Sequence[Band]) -> list[object]:
-        # В bands уровни всегда равны 0.0: уровни хранятся исключительно в пресетах
         return [{"frequency_hz": band.frequency_hz, "level_db": 0.0} for band in bands]
 
     return {
@@ -436,12 +448,15 @@ def settings_to_data(settings: Settings) -> dict[str, object]:
             "max_db": settings.level_scale.max_db,
             "step_db": settings.level_scale.step_db,
         },
-        "bands": bands_data(settings.bands),
+        "bands": bands_data(settings.default_bands if settings.default_bands else settings.bands),
         "presets": [
             {
                 "name": preset.name,
                 "device": _device_data(preset.device),
-                "levels": list(preset.levels),
+                "bands": [
+                    {"frequency_hz": band.frequency_hz, "level_db": band.level_db}
+                    for band in preset.bands
+                ],
             }
             for preset in settings.presets
         ],
@@ -485,14 +500,12 @@ def settings_to_text(settings: Settings) -> str:
 
 
 def save_settings(path: Path, settings: Settings) -> None:
-    """Записать settings.json атомарно: временный файл рядом и замена.
-
-    Данные проверяются до записи и сверяются после сериализации, поэтому
-    некорректное состояние не попадает в файл.
-    """
-    # В сохранённом файле полосы всегда имеют нулевой уровень
-    normalized_bands = tuple(Band(b.frequency_hz, 0.0) for b in settings.bands)
-    settings_to_save = replace(settings, bands=normalized_bands)
+    """Записать settings.json атомарно: временный файл рядом и замена."""
+    default_bands_zero = tuple(
+        Band(b.frequency_hz, 0.0)
+        for b in (settings.default_bands if settings.default_bands else settings.bands)
+    )
+    settings_to_save = replace(settings, default_bands=default_bands_zero)
 
     try:
         validate_settings(settings_to_save)
@@ -524,10 +537,7 @@ def save_settings(path: Path, settings: Settings) -> None:
 
 
 def quarantine_corrupted(path: Path, now: datetime | None = None) -> Path:
-    """Переименовать повреждённый файл в settings.corrupted-<дата-время>.json.
-
-    Существующие файлы не затираются: при совпадении имени добавляется номер.
-    """
+    """Переименовать повреждённый файл в settings.corrupted-<дата-время>.json."""
     stamp = (now or datetime.now()).strftime("%Y%m%d-%H%M%S")
     target = path.with_name(f"{path.stem}.corrupted-{stamp}{path.suffix}")
     counter = 1
@@ -542,14 +552,7 @@ def quarantine_corrupted(path: Path, now: datetime | None = None) -> Path:
 
 
 def load_settings_at_startup(path: Path) -> Settings:
-    """Загрузка при запуске программы.
-
-    Файл без синтаксиса или с недопустимыми данными переименовывается в
-    settings.corrupted-<дата-время>.json, чтобы его не затёрли и можно было
-    исправить; значений по умолчанию нет, поэтому после этого запуск невозможен.
-    Файл, которого нет, нельзя прочитать или который создан другой версией
-    программы, остаётся на месте.
-    """
+    """Загрузка при запуске программы."""
     try:
         return load_settings(path)
     except SettingsFormatError as err:

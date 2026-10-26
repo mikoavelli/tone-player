@@ -50,7 +50,7 @@ def make_settings(**changes: object) -> Settings:
 
 
 def with_preset(**changes: object) -> Settings:
-    preset = Preset(name="Колонки", device="Speakers [MME]", levels=(0.0, 1.5))
+    preset = Preset(name="Колонки", device="Speakers [MME]", bands=make_bands(2))
     return make_settings(presets=(preset,), active_preset="Колонки", **changes)
 
 
@@ -149,29 +149,29 @@ class TestValidation(unittest.TestCase):
         self.assertInvalid(make_settings(bands=(Band(500.0, float("inf")),)))
 
     def test_duplicate_preset_names_are_rejected_ignoring_case(self) -> None:
-        first = Preset("Колонки", None, (0.0,))
-        second = Preset("колонки", None, (0.0,))
+        first = Preset("Колонки", None, make_bands(1))
+        second = Preset("колонки", None, make_bands(1))
         self.assertInvalid(make_settings(presets=(first, second)))
 
     def test_preset_name_rules(self) -> None:
         for name in ("", " x", "x ", "a" * 65, "a\tb"):
             with self.subTest(name=name):
-                preset = Preset(name, None, (0.0,))
+                preset = Preset(name, None, make_bands(1))
                 self.assertInvalid(make_settings(presets=(preset,)))
 
-    def test_preset_levels_are_checked(self) -> None:
+    def test_preset_bands_are_checked(self) -> None:
         for level in (10.5, -10.5, 1.2):
             with self.subTest(level=level):
-                preset = Preset("x", None, (level,))
+                preset = Preset("x", None, (Band(500.0, level),))
                 self.assertInvalid(make_settings(presets=(preset,)))
 
-    def test_preset_level_count(self) -> None:
+    def test_preset_band_count(self) -> None:
         self.assertInvalid(make_settings(presets=(Preset("x", None, ()),)))
-        self.assertInvalid(make_settings(presets=(Preset("x", None, (0.0,) * 65),)))
+        self.assertInvalid(make_settings(presets=(Preset("x", None, make_bands(65)),)))
 
-    def test_preset_may_have_different_level_count_than_global_bands(self) -> None:
-        shorter = Preset("Короче", None, (0.0, 1.0))
-        longer = Preset("Длиннее", None, (0.0, 1.0, 2.0, 3.0, 4.0))
+    def test_preset_may_have_different_band_count_than_global_bands(self) -> None:
+        shorter = Preset("Короче", None, make_bands(2))
+        longer = Preset("Длиннее", None, make_bands(5))
 
         validate_settings(make_settings(presets=(shorter, longer)))
 
@@ -267,7 +267,7 @@ class TestParsing(unittest.TestCase):
         self.assertIsNone(parse_settings(data).device)
 
     def test_default_preset_device_is_serialized_as_default(self) -> None:
-        preset = Preset("Колонки", None, (0.0, 1.5))
+        preset = Preset("Колонки", None, make_bands(2))
         data = settings_to_data(make_settings(presets=(preset,), active_preset="Колонки"))
 
         presets = data["presets"]
@@ -276,23 +276,14 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(item["device"], "default")
         self.assertIsNone(parse_settings(data).presets[0].device)
 
-    def test_preset_is_serialized_with_levels_only(self) -> None:
+    def test_preset_is_serialized_with_bands(self) -> None:
         data = settings_to_data(with_preset())
 
         presets = data["presets"]
         assert isinstance(presets, list)
         item = cast("dict[str, object]", presets[0])
-        self.assertEqual(item["levels"], [0.0, 1.5])
-        self.assertNotIn("bands", item)
-
-    def test_positional_preset_levels_are_parsed(self) -> None:
-        data = self.data()
-        presets = data["presets"]
-        assert isinstance(presets, list)
-        item = cast("dict[str, object]", presets[0])
-        item["levels"] = [2.0, -3.0, 1.0]
-
-        self.assertEqual(parse_settings(data).presets[0].levels, (2.0, -3.0, 1.0))
+        self.assertIn("bands", item)
+        self.assertNotIn("levels", item)
 
     def test_integers_are_accepted_as_numbers(self) -> None:
         data = self.data()
@@ -318,22 +309,13 @@ class TestParsing(unittest.TestCase):
 
         self.assertRejected(data)
 
-    def test_old_preset_bands_are_rejected(self) -> None:
+    def test_old_preset_levels_are_rejected(self) -> None:
         data = self.data()
         presets = data["presets"]
         assert isinstance(presets, list)
         item = cast("dict[str, object]", presets[0])
-        del item["levels"]
-        item["bands"] = [{"frequency_hz": 500.0, "level_db": 0.0}]
-
-        self.assertRejected(data)
-
-    def test_preset_levels_must_be_numbers(self) -> None:
-        data = self.data()
-        presets = data["presets"]
-        assert isinstance(presets, list)
-        item = cast("dict[str, object]", presets[0])
-        item["levels"] = [0.0, "громко"]
+        del item["bands"]
+        item["levels"] = [0.0, 1.0]
 
         self.assertRejected(data)
 

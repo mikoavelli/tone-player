@@ -139,11 +139,19 @@ class Band:
 
 @dataclass(frozen=True)
 class Preset:
-    """Именованный набор уровней для общего списка частот и устройство вывода."""
+    """Именованный набор полос (частоты и поправки уровней) и устройство вывода."""
 
     name: str
     device: str | None
-    levels: tuple[float, ...]
+    bands: tuple[Band, ...]
+
+    @property
+    def frequencies(self) -> tuple[float, ...]:
+        return tuple(b.frequency_hz for b in self.bands)
+
+    @property
+    def levels(self) -> tuple[float, ...]:
+        return tuple(b.level_db for b in self.bands)
 
 
 @dataclass(frozen=True)
@@ -160,6 +168,15 @@ class Settings:
     active_preset: str | None
     level_scale: LevelScale = DEFAULT_LEVEL_SCALE
     autoplay: bool = True
+    default_bands: tuple[Band, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.default_bands and self.bands:
+            object.__setattr__(
+                self,
+                "default_bands",
+                tuple(Band(b.frequency_hz, 0.0) for b in self.bands),
+            )
 
     @property
     def frequencies(self) -> tuple[float, ...]:

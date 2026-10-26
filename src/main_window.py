@@ -84,7 +84,6 @@ from models import (
     ToneConfig,
 )
 from presets import (
-    aligned_levels,
     apply_preset,
     delete_preset,
     find_preset,
@@ -113,19 +112,10 @@ from ui_signals import connect_action, connect_index, connect_text, connect_togg
 from ui_text import format_db, format_duration, format_frequency_value
 
 REFRESH_INTERVAL_MS = 50
-# Изменения настроек записываются не на каждый шаг ползунка, а после паузы.
 SAVE_DELAY_MS = 600
-# Служебные сообщения (например, «пресет сохранён») не должны висеть постоянно.
 NOTICE_TIMEOUT_MS = 3500
-# Внешние правки settings.json подхватываются после короткой паузы.
 SETTINGS_RELOAD_DELAY_MS = 250
 
-# -----------------------------------------------------------------------------
-# Оформление
-# -----------------------------------------------------------------------------
-
-# Шрифты перечислены по предпочтению: берётся первый установленный в системе,
-# иначе — системный шрифт по умолчанию (или моноширинный).
 _SANS_FAMILIES = ("IBM Plex Sans", "Noto Sans", "Segoe UI", "Ubuntu", "DejaVu Sans")
 _MONO_FAMILIES = (
     "IBM Plex Mono",
@@ -387,7 +377,6 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     on_accent=COLOR_ON_ACCENT,
 )
 
-
 PLAY_BUTTON_LOOK = {
     "start": ("Запустить", "start"),
     "pause": ("Пауза", "pause"),
@@ -396,7 +385,6 @@ PLAY_BUTTON_LOOK = {
 
 
 def play_button_mode(state: PlayerState) -> str:
-    """Режим главной кнопки: что она сделает при нажатии в состоянии state."""
     if state is PlayerState.PLAYING:
         return "pause"
     if state is PlayerState.PAUSED:
@@ -405,17 +393,14 @@ def play_button_mode(state: PlayerState) -> str:
 
 
 def autoplay_text(enabled: bool) -> str:
-    """Подпись переключателя автовоспроизведения по его состоянию."""
     return "Автовоспроизведение: " + ("включено" if enabled else "выключено")
 
 
 def autoplay_label() -> str:
-    """Постоянная подпись переключателя автовоспроизведения."""
     return "Автовоспроизведение"
 
 
 def pick_font_family(candidates: Sequence[str], fallback: str) -> str:
-    """Первое семейство из candidates, установленное в системе, иначе fallback."""
     available = set(QFontDatabase.families())
     for name in candidates:
         if name in available:
@@ -423,13 +408,7 @@ def pick_font_family(candidates: Sequence[str], fallback: str) -> str:
     return fallback
 
 
-# -----------------------------------------------------------------------------
-# Иконки и собственные виджеты
-# -----------------------------------------------------------------------------
-
-
 def _draw_glyph(kind: str, size: int, color: str) -> QPixmap:
-    """Нарисовать значок kind в квадрате size × size (сетка 24 × 24)."""
     ratio = 2
     pixmap = QPixmap(size * ratio, size * ratio)
     pixmap.setDevicePixelRatio(ratio)
@@ -528,7 +507,6 @@ def _make_icon(kind: str, size: int, normal: str, disabled: str) -> QIcon:
 
 
 def make_icons() -> dict[str, QIcon]:
-    """Значки кнопок: цвет в обычном и в отключённом состоянии подобран под тему."""
     return {
         "start": _make_icon("start", 18, COLOR_ON_ACCENT, COLOR_DISABLED),
         "pause": _make_icon("pause", 18, COLOR_ON_ACCENT, COLOR_DISABLED),
@@ -542,8 +520,6 @@ def make_icons() -> dict[str, QIcon]:
 
 
 class ToggleSwitch(QAbstractButton):
-    """Переключатель-«тумблер»; API как у отмечаемой кнопки (isChecked, toggled)."""
-
     _TRACK_WIDTH = 48
     _TRACK_HEIGHT = 26
     _KNOB = 20
@@ -583,8 +559,6 @@ class ToggleSwitch(QAbstractButton):
 
 
 class ChevronComboBox(QComboBox):
-    """Выпадающий список со стрелкой-шевроном, нарисованной в цвет темы."""
-
     def paintEvent(self, e: QPaintEvent | None) -> None:
         super().paintEvent(e)
         painter = QPainter(self)
@@ -613,8 +587,6 @@ class ChevronComboBox(QComboBox):
 
 
 class BandScrollArea(QScrollArea):
-    """Прокрутка полос: колесо мыши двигает ленту по горизонтали."""
-
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWidgetResizable(True)
@@ -643,34 +615,14 @@ class MainWindow(QMainWindow):
         stream_factory: StreamFactory | None = None,
     ) -> None:
         super().__init__()
-        # Инициализация уровней: дефолтный пресет строго 0.0 дБ.
-        # Если активен пользовательский пресет — загружаем его сохранённые уровни.
-        bands_zero = tuple(Band(b.frequency_hz, 0.0) for b in settings.bands)
-        if settings.active_preset is not None:
-            active_p = find_preset(settings, settings.active_preset)
-            if active_p is not None:
-                active_levels = aligned_levels(active_p.levels, len(settings.bands))
-                self._settings = replace(
-                    settings,
-                    bands=tuple(
-                        Band(b.frequency_hz, lvl)
-                        for b, lvl in zip(settings.bands, active_levels, strict=True)
-                    ),
-                )
-            else:
-                active_levels = tuple(0.0 for _ in settings.bands)
-                self._settings = replace(settings, bands=bands_zero, active_preset=None)
-        else:
-            active_levels = tuple(0.0 for _ in settings.bands)
-            self._settings = replace(settings, bands=bands_zero)
-
+        self._settings = settings
         self._focused_index = 0
         self._settings_path = settings_path
         self._settings_file_bytes = self._read_settings_file()
         self._config = ToneConfig.from_settings(self._settings)
         self._player = TonePlayer(
             self._config,
-            active_levels,
+            self._settings.levels,
             MASTER_BASE_DB + self._settings.master_gain_db,
             stream_factory=stream_factory,
             level_scale=self._settings.level_scale,
@@ -681,7 +633,6 @@ class MainWindow(QMainWindow):
         self._play_button_mode = ""
         self._bands: BandStrip | None = None
         self._last_band_index = -1
-        # Сообщения под окном: о недоступном устройстве и о неудачной записи настроек.
         self._notice = ""
         self._save_error = ""
         self._notice_timer = QTimer(self)
@@ -748,17 +699,11 @@ class MainWindow(QMainWindow):
 
         self._refresh()
 
-    # -------------------------------------------------------------------------
-    # Свойства
-    # -------------------------------------------------------------------------
-
     @property
     def player(self) -> TonePlayer:
-        """Проигрыватель, управляемый окном."""
         return self._player
 
     def closeEvent(self, a0: QCloseEvent | None) -> None:
-        """При закрытии окна дописать настройки, остановить таймер и освободить устройство."""
         if self._save_timer.isActive():
             self._save_settings()
         if self._save_error:
@@ -768,10 +713,6 @@ class MainWindow(QMainWindow):
         self._timer.stop()
         self._player.stop()
         super().closeEvent(a0)
-
-    # -------------------------------------------------------------------------
-    # Построение интерфейса
-    # -------------------------------------------------------------------------
 
     def _mono_font(self, pixel_size: int, weight: QFont.Weight = QFont.Weight.Medium) -> QFont:
         font = QFont(self._mono_family)
@@ -807,7 +748,7 @@ class MainWindow(QMainWindow):
         self.preset_selector.setFixedHeight(38)
         self.preset_selector.setMinimumWidth(150)
         self.preset_selector.setMaximumWidth(210)
-        self.preset_selector.setToolTip("Пресет: уровни эквалайзера и устройство вывода")
+        self.preset_selector.setToolTip("Пресет: полосы эквалайзера и устройство вывода")
         connect_index(self.preset_selector.currentIndexChanged, self._on_preset_changed)
         row.addWidget(self.preset_selector)
 
@@ -930,7 +871,6 @@ class MainWindow(QMainWindow):
         return row
 
     def _frequency_html(self, value: str, unit: str = "Гц") -> str:
-        """Частота: число моноширинным акцентным шрифтом и приглушённая единица."""
         html = (
             f"<span style=\"font-family:'{self._mono_family}'; font-size:{FREQUENCY_VALUE_PX}px; "
             f'font-weight:600; color:{COLOR_ACCENT};">{value}</span>'
@@ -1033,7 +973,7 @@ class MainWindow(QMainWindow):
         focused_index: int | None = None
         focus = QApplication.focusWidget()
         if focus is not None and self._bands is not None:
-            for index in range(len(self._settings.bands)):
+            for index in range(self._bands.count):
                 if focus is self._bands.column(index).slider:
                     focused_index = index
                     break
@@ -1060,30 +1000,24 @@ class MainWindow(QMainWindow):
         self._focused_index = index
         strip.column(index).slider.setFocus()
 
-    # -------------------------------------------------------------------------
-    # Обработчики
-    # -------------------------------------------------------------------------
-
     def _get_focused_band_index(self) -> int:
-        """Индекс полосы, чей ползунок выбран в данный момент."""
         if self._bands is not None:
             focus = QApplication.focusWidget()
-            for i in range(len(self._settings.bands)):
+            for i in range(self._bands.count):
                 if focus is self._bands.column(i).slider:
                     self._focused_index = i
                     return i
-        return min(max(self._focused_index, 0), len(self._settings.bands) - 1)
+        return min(max(self._focused_index, 0), max(len(self._settings.bands) - 1, 0))
 
     def _is_any_band_slider_focused(self) -> bool:
         if self._bands is not None:
             focus = QApplication.focusWidget()
-            for i in range(len(self._settings.bands)):
+            for i in range(self._bands.count):
                 if focus is self._bands.column(i).slider:
                     return True
         return False
 
     def _on_play_pause(self) -> None:
-        """Главная кнопка: запуск, пауза или продолжение — по состоянию проигрывателя."""
         state = self._player.state
         if state is PlayerState.PLAYING:
             self._player.pause()
@@ -1136,7 +1070,6 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(a0)
 
     def _navigate(self, offset: int) -> None:
-        """Переместить фокус (кругляш) между полосами без переключения звука."""
         if self.master_slider.hasFocus():
             if offset > 0:
                 self._focus_band(self._focused_index)
@@ -1157,7 +1090,7 @@ class MainWindow(QMainWindow):
             self._band_scroll.ensureWidgetVisible(self._bands.column(new_index), 48, 0)
 
     def _focus_band(self, index: int) -> None:
-        if self._bands is not None:
+        if self._bands is not None and index < self._bands.count:
             self._focused_index = index
             self._bands.column(index).slider.setFocus()
 
@@ -1167,38 +1100,32 @@ class MainWindow(QMainWindow):
             bar.setValue(bar.value() - delta)
 
     def _nudge_active_band(self, direction: int) -> None:
-        """Изменить уровень той полосы, чей кругляш сейчас в фокусе."""
         index = self._get_focused_band_index()
         scale = self._settings.level_scale
         current = self._player.level_at(index)
         level = scale.clamp(current + direction * scale.step_db)
         if level != current:
             self._on_band_level(index, level)
-            if self._bands is not None:
+            if self._bands is not None and index < self._bands.count:
                 self._bands.column(index).set_level(level)
 
     def _on_activate_current(self) -> None:
-        """Enter на текущем элементе: направить воспроизведение на полосу в фокусе."""
         if self.master_slider.hasFocus():
             return
         index = self._get_focused_band_index()
         self._on_activate_band(index)
 
     def _on_activate_band(self, index: int) -> None:
-        """Активировать полосу: сброс/старт воспроизведения с 0:00 без смены общего состояния."""
         state = self._player.state
         if state is PlayerState.PLAYING:
-            # Звук идёт: сразу воспроизводим выбранную полосу с начала (или перезапускаем текущую)
             self._start_playback(index)
             return
 
-        # Звук не идёт (PAUSED, IDLE, FINISHED): назначаем полосу, сбрасываем тон, но звук не включаем
         self._player.select(index)
         self._finishing_handled = False
         self._refresh()
 
     def _start_playback(self, index: int) -> None:
-        """Запустить воспроизведение с тона index, показав ошибку устройства."""
         try:
             self._player.start(index)
         except AudioError as error:
@@ -1213,17 +1140,13 @@ class MainWindow(QMainWindow):
         self._refresh()
 
     def _on_band_level(self, index: int, level_db: float) -> None:
-        # Изменение уровня применяется исключительно вживую к звуку.
-        # В файл конфигурации оно не записывается автоматически.
         self._player.set_level_at(index, level_db)
 
     def _on_band_select(self, index: int) -> None:
-        """Клик по полосе: переводит фокус кругляша на неё без срыва текущего звука."""
         self._focused_index = index
         self._focus_band(index)
 
     def _on_band_play(self, index: int) -> None:
-        """Клик по кнопке ▶ под полосой: прямое управление воспроизведением этой частоты."""
         self._focus_band(index)
         state = self._player.state
         if index == self._player.tone_index:
@@ -1258,7 +1181,19 @@ class MainWindow(QMainWindow):
         dialog = SettingsDialog(self._settings, self)
         dialog.setStyleSheet(self.styleSheet())
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self._apply_settings(dialog.settings())
+            new_settings = dialog.settings()
+            active_name = self._settings.active_preset
+            if active_name is not None:
+                new_presets = tuple(
+                    replace(p, bands=new_settings.bands)
+                    if p.name.casefold() == active_name.casefold()
+                    else p
+                    for p in new_settings.presets
+                )
+                new_settings = replace(new_settings, presets=new_presets)
+            else:
+                new_settings = replace(new_settings, default_bands=new_settings.bands)
+            self._apply_settings(new_settings)
 
     def _apply_settings(
         self,
@@ -1267,7 +1202,6 @@ class MainWindow(QMainWindow):
         notice: str = "",
         persist: bool = True,
     ) -> None:
-        """Применить настройки целиком: остановить звук, пересобрать полосы и ползунки."""
         self._player.stop()
         self._settings = settings
         self._config = ToneConfig.from_settings(settings)
@@ -1323,18 +1257,29 @@ class MainWindow(QMainWindow):
             if index >= 0:
                 self.preset_selector.setCurrentIndex(index)
         self.preset_selector.blockSignals(False)
-        self.preset_delete_button.setEnabled(self._settings.active_preset is not None)
+        is_user_preset = self._settings.active_preset is not None
+        self.preset_delete_button.setEnabled(is_user_preset)
+        self.settings_button.setEnabled(True)
+        self.settings_button.setToolTip("Настройки")
 
     def _on_preset_changed(self, index: int) -> None:
         data = cast("object", self.preset_selector.itemData(index))
         if data is None:
-            bands_zero = tuple(Band(b.frequency_hz, 0.0) for b in self._settings.bands)
-            self._settings = replace(self._settings, bands=bands_zero, active_preset=None)
-            self.preset_delete_button.setEnabled(False)
-            for i in range(len(self._settings.bands)):
-                self._player.set_level_at(i, 0.0)
-                if self._bands is not None:
-                    self._bands.column(i).set_level(0.0)
+            self._player.stop()
+            default_bands = (
+                self._settings.default_bands
+                if self._settings.default_bands
+                else tuple(Band(b.frequency_hz, 0.0) for b in self._settings.bands)
+            )
+            self._settings = replace(self._settings, bands=default_bands, active_preset=None)
+            self._config = ToneConfig.from_settings(self._settings)
+            self._player.reconfigure(
+                self._config, self._settings.levels, level_scale=self._settings.level_scale
+            )
+            self._focused_index = 0
+            self._rebuild_bands()
+            self._sync_device_selector()
+            self._refresh_presets()
             self._store(self._settings)
             self._refresh()
             return
@@ -1356,7 +1301,6 @@ class MainWindow(QMainWindow):
         self._apply_settings(application.settings, notice=notice)
 
     def _ask_preset_name(self, default: str) -> str | None:
-        """Запросить имя пресета в оформленном диалоге."""
         dialog = QDialog(self)
         dialog.setWindowTitle("Сохранить пресет")
         dialog.setMinimumWidth(400)
@@ -1409,10 +1353,14 @@ class MainWindow(QMainWindow):
                 if answer != QMessageBox.StandardButton.Yes:
                     return
                 overwrite = True
+            current_bands = tuple(
+                Band(band.frequency_hz, self._player.level_at(i))
+                for i, band in enumerate(self._settings.bands)
+            )
             settings = save_preset(
                 self._settings,
                 name,
-                levels=self._player.levels,
+                bands=current_bands,
                 overwrite=overwrite,
             )
         except PresetError as error:
@@ -1440,23 +1388,13 @@ class MainWindow(QMainWindow):
         except PresetError as error:
             _ = QMessageBox.warning(self, "Пресет не удалён", str(error))
             return
-        bands_zero = tuple(Band(b.frequency_hz, 0.0) for b in settings.bands)
-        self._settings = replace(settings, bands=bands_zero, active_preset=None)
-        for i in range(len(self._settings.bands)):
-            self._player.set_level_at(i, 0.0)
-            if self._bands is not None:
-                self._bands.column(i).set_level(0.0)
-        self._store(self._settings)
-        self._refresh_presets()
-        self._refresh()
+        self._apply_settings(settings)
 
     def _store(self, settings: Settings) -> None:
-        """Принять новые настройки; файл записывается после короткой паузы."""
         self._settings = settings
         self._save_timer.start()
 
     def _show_notice(self, text: str) -> None:
-        """Показать служебное сообщение и убрать его через несколько секунд."""
         self._notice = text
         if text:
             self._notice_timer.start()
@@ -1482,7 +1420,6 @@ class MainWindow(QMainWindow):
         self._reload_timer.start()
 
     def _reload_settings(self) -> None:
-        """Подхватить settings.json, изменённый снаружи, не затирая его."""
         _ = self._settings_watcher.addPath(str(self._settings_path))
         content = self._read_settings_file()
         if not content or content == self._settings_file_bytes:
@@ -1518,10 +1455,6 @@ class MainWindow(QMainWindow):
             self._settings_file_bytes = self._read_settings_file()
             _ = self._settings_watcher.addPath(str(self._settings_path))
 
-    # -------------------------------------------------------------------------
-    # Обновление состояния
-    # -------------------------------------------------------------------------
-
     def _refresh(self) -> None:
         state = self._player.state
         progress = self._player.progress()
@@ -1556,12 +1489,12 @@ class MainWindow(QMainWindow):
             self._bands.set_current(progress.tone_index, state is PlayerState.PLAYING)
             if progress.tone_index != self._last_band_index:
                 self._last_band_index = progress.tone_index
-                # Автоскролл подстраивается под играющую частоту только если пользователь не настраивает другую полосу
                 focused_idx = self._get_focused_band_index()
                 if focused_idx == progress.tone_index or not self._is_any_band_slider_focused():
-                    self._band_scroll.ensureWidgetVisible(
-                        self._bands.column(progress.tone_index), 48, 0
-                    )
+                    if progress.tone_index < self._bands.count:
+                        self._band_scroll.ensureWidgetVisible(
+                            self._bands.column(progress.tone_index), 48, 0
+                        )
 
         self.master_value_label.setText(
             format_db(self._player.master_db - MASTER_BASE_DB, unit=False)

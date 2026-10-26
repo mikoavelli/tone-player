@@ -13,8 +13,6 @@ class PresetApplication:
     """Результат применения пресета."""
 
     settings: Settings
-    # Устройство из пресета, которого нет на этом компьютере; вместо него
-    # выбрано устройство по умолчанию.
     missing_device: str | None
 
 
@@ -43,48 +41,39 @@ def _require(settings: Settings, name: str) -> Preset:
     return preset
 
 
-def aligned_levels(levels: Sequence[float], count: int) -> tuple[float, ...]:
-    """Уровни пресета по позициям глобального списка; новые полосы получают 0 дБ."""
-    return tuple(levels[index] if index < len(levels) else 0.0 for index in range(count))
-
-
 def save_preset(
     settings: Settings,
     name: str,
     *,
-    levels: Sequence[float] | None = None,
+    bands: Sequence[Band] | None = None,
     overwrite: bool = False,
 ) -> Settings:
-    """Сохранить уровни и устройство под именем name и сделать пресет активным.
-
-    Частоты в пресет не входят: список частот общий для всей программы.
-    Существующий пресет заменяется только при overwrite=True; он остаётся на
-    своём месте в списке.
-    """
+    """Сохранить полосы (частоты и уровни) под именем name и сделать пресет активным."""
     name = normalize_name(name)
     existing = find_preset(settings, name)
     if existing is not None and not overwrite:
         raise PresetError(f"Пресет '{existing.name}' уже существует.")
 
-    preset_levels = tuple(levels) if levels is not None else settings.levels
-    preset = Preset(name=name, device=settings.device, levels=preset_levels)
+    preset_bands = tuple(bands) if bands is not None else settings.bands
+    preset = Preset(name=name, device=settings.device, bands=preset_bands)
     if existing is None:
         presets = (*settings.presets, preset)
     else:
         presets = tuple(preset if item is existing else item for item in settings.presets)
-    return replace(settings, presets=presets, active_preset=name)
+    return replace(settings, presets=presets, bands=preset_bands, active_preset=name)
 
 
 def delete_preset(settings: Settings, name: str) -> Settings:
-    """Удалить пресет; настройки остаются как были, активный пресет сбрасывается."""
+    """Удалить пресет; активный пресет переходит на дефолтный."""
     target = _require(settings, name)
     active = settings.active_preset
     was_active = active is not None and active.casefold() == name.casefold()
-    return replace(
-        settings,
-        presets=tuple(item for item in settings.presets if item is not target),
-        active_preset=None if was_active else active,
+    new_presets = tuple(item for item in settings.presets if item is not target)
+    new_active = None if was_active else active
+    new_bands = (
+        settings.default_bands if (was_active and settings.default_bands) else settings.bands
     )
+    return replace(settings, presets=new_presets, active_preset=new_active, bands=new_bands)
 
 
 def rename_preset(settings: Settings, name: str, new_name: str) -> Settings:
@@ -108,37 +97,25 @@ def rename_preset(settings: Settings, name: str, new_name: str) -> Settings:
 def apply_preset(
     settings: Settings, name: str, available_devices: Collection[str]
 ) -> PresetApplication:
-    """Применить уровни пресета к общему списку частот и выбрать его устройство.
-
-    Уровни берутся по позициям: если глобальный список стал длиннее, новые
-    полосы получают 0 дБ; лишние сохранённые уровни игнорируются.
-    Общий уровень не меняется: загрузка пресета не должна неожиданно изменить
-    громкость. available_devices — метки устройств, найденных на этом компьютере.
-    """
+    """Применить пресет: заменяет полосы (частоты и уровни) и выбирает его устройство."""
     preset = _require(settings, name)
-    levels = aligned_levels(preset.levels, len(settings.bands))
-    bands = tuple(
-        Band(band.frequency_hz, level) for band, level in zip(settings.bands, levels, strict=True)
-    )
-
     device = preset.device
     missing: str | None = None
     if device is not None and device not in available_devices:
         missing = device
         device = None
     return PresetApplication(
-        settings=replace(settings, bands=bands, device=device, active_preset=preset.name),
+        settings=replace(settings, bands=preset.bands, device=device, active_preset=preset.name),
         missing_device=missing,
     )
 
 
-def is_modified(settings: Settings, current_levels: Sequence[float] | None = None) -> bool:
-    """Отличаются ли текущие уровни или устройство от активного пресета."""
+def is_modified(settings: Settings, current_bands: Sequence[Band] | None = None) -> bool:
+    """Отличаются ли текущие полосы или устройство от активного пресета."""
     if settings.active_preset is None:
         return False
     preset = find_preset(settings, settings.active_preset)
     if preset is None:
         return False
-    expected = aligned_levels(preset.levels, len(settings.bands))
-    levels = tuple(current_levels) if current_levels is not None else settings.levels
-    return levels != expected or settings.device != preset.device
+    bands = tuple(current_bands) if current_bands is not None else settings.bands
+    return bands != preset.bands or settings.device != preset.device

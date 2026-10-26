@@ -39,7 +39,6 @@ from models import (
 from settings_store import validate_settings
 from ui_signals import connect_action
 
-# Ширина подписей одинакова во всех секциях: поля начинаются ровно друг под другом.
 LABEL_WIDTH = 190
 BUTTON_HEIGHT = 34
 
@@ -91,16 +90,19 @@ def _frequencies_text(bands: tuple[Band, ...]) -> str:
 
 
 def _parse_frequencies(text: str) -> tuple[float, ...] | None:
+    """Разобрать частоты, убрать дубликаты и отсортировать по возрастанию."""
     parts = [part for part in re.split(r"[\s,;]+", text.strip()) if part]
     if not parts:
         return None
-    values: list[float] = []
+    unique: set[float] = set()
     try:
         for part in parts:
-            values.append(float(part.replace(",", ".")))
+            unique.add(round(float(part.replace(",", ".")), 3))
     except ValueError:
         return None
-    return tuple(values)
+    if not unique:
+        return None
+    return tuple(sorted(unique))
 
 
 def _reset_button(text: str, tooltip: str) -> QPushButton:
@@ -118,7 +120,13 @@ class SettingsDialog(QDialog):
         self._bands = list(settings.bands)
         self._result: Settings | None = None
 
-        self.setWindowTitle("Настройки")
+        is_default = settings.active_preset is None
+
+        self.setWindowTitle(
+            f"Настройки пресета «{settings.active_preset}»"
+            if settings.active_preset
+            else "Настройки"
+        )
         self.setMinimumWidth(480)
 
         root = QVBoxLayout(self)
@@ -178,16 +186,28 @@ class SettingsDialog(QDialog):
         _row(tone_form, "Частота дискретизации", self.rate_spin)
         root.addLayout(tone_form)
 
-        root.addWidget(_section("Частоты"))
+        frequencies_section_title = "Частоты" if is_default else "Частоты пресета"
+        root.addWidget(_section(frequencies_section_title))
         self.frequencies_edit = QPlainTextEdit(_frequencies_text(settings.bands))
         self.frequencies_edit.setFixedHeight(92)
         self.frequencies_edit.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
-        self.frequencies_edit.setToolTip("Частоты через запятую, пробел или с новой строки.")
+
+        if is_default:
+            self.frequencies_edit.setReadOnly(True)
+            self.frequencies_edit.setToolTip("Частоты пресета «По умолчанию» неизменяемы.")
+            hint_text = (
+                "Частоты пресета «По умолчанию» неизменяемы. Создайте пресет, "
+                "чтобы настроить свой набор частот."
+            )
+        else:
+            self.frequencies_edit.setToolTip("Частоты через запятую, пробел или с новой строки.")
+            hint_text = (
+                "Через запятую, пробел или с новой строки. Сортируются и очищаются от повторов "
+                "автоматически."
+            )
+
         root.addWidget(self.frequencies_edit)
-        hint = QLabel(
-            "Через запятую, пробел или с новой строки. По возрастанию. "
-            "Частоты общие для всех пресетов."
-        )
+        hint = QLabel(hint_text)
         hint.setObjectName("subtitleLabel")
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -195,6 +215,9 @@ class SettingsDialog(QDialog):
         levels_row = QHBoxLayout()
         levels_row.addStretch(1)
         reset_levels = _reset_button("Сбросить уровни", "Обнулить поправки всех полос")
+        if is_default:
+            reset_levels.setEnabled(False)
+            reset_levels.setToolTip("Уровни пресета «По умолчанию» всегда 0 дБ.")
         connect_action(reset_levels.clicked, self._reset_levels)
         levels_row.addWidget(reset_levels)
         root.addLayout(levels_row)
@@ -237,29 +260,27 @@ class SettingsDialog(QDialog):
         )
 
     def _on_accept(self) -> None:
-        frequencies = _parse_frequencies(self.frequencies_edit.toPlainText())
-        if frequencies is None:
-            _ = QMessageBox.warning(
-                self, "Проверьте частоты", "Введите частоты числами через запятую."
-            )
-            return
-
         scale = self._scale()
-        old_bands = self._bands
-        bands = tuple(
-            Band(
-                frequency,
-                scale.clamp(old_bands[index].level_db if index < len(old_bands) else 0.0),
+        if self._settings.active_preset is None:
+            # Для пресета по умолчанию частоты не меняются, уровни остаются 0.0
+            bands = tuple(Band(b.frequency_hz, 0.0) for b in self._settings.bands)
+        else:
+            frequencies = _parse_frequencies(self.frequencies_edit.toPlainText())
+            if frequencies is None:
+                _ = QMessageBox.warning(
+                    self, "Проверьте частоты", "Введите частоты числами через запятую."
+                )
+                return
+
+            old_levels = {round(band.frequency_hz, 3): band.level_db for band in self._bands}
+            bands = tuple(
+                Band(
+                    frequency,
+                    scale.clamp(old_levels.get(frequency, 0.0)),
+                )
+                for frequency in frequencies
             )
-            for index, frequency in enumerate(frequencies)
-        )
-        presets = tuple(
-            replace(
-                preset,
-                levels=tuple(scale.clamp(level) for level in preset.levels),
-            )
-            for preset in self._settings.presets
-        )
+
         candidate = replace(
             self._settings,
             seconds_per_tone=self.seconds_spin.value(),
@@ -267,7 +288,6 @@ class SettingsDialog(QDialog):
             fade_ms=float(self.fade_spin.value()),
             level_scale=scale,
             bands=bands,
-            presets=presets,
         )
         try:
             validate_settings(candidate)
