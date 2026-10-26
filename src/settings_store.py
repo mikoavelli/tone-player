@@ -505,7 +505,12 @@ def save_settings(path: Path, settings: Settings) -> None:
         Band(b.frequency_hz, 0.0)
         for b in (settings.default_bands if settings.default_bands else settings.bands)
     )
-    settings_to_save = replace(settings, default_bands=default_bands_zero)
+    active_bands = default_bands_zero if settings.active_preset is None else settings.bands
+    settings_to_save = replace(
+        settings,
+        bands=active_bands,
+        default_bands=default_bands_zero,
+    )
 
     try:
         validate_settings(settings_to_save)

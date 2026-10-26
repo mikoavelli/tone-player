@@ -50,8 +50,15 @@ def make_settings(**changes: object) -> Settings:
 
 
 def with_preset(**changes: object) -> Settings:
-    preset = Preset(name="Колонки", device="Speakers [MME]", bands=make_bands(2))
-    return make_settings(presets=(preset,), active_preset="Колонки", **changes)
+    preset_bands = make_bands(2)
+    preset = Preset(name="Колонки", device="Speakers [MME]", bands=preset_bands)
+    return make_settings(
+        bands=preset_bands,
+        default_bands=make_bands(3),
+        presets=(preset,),
+        active_preset="Колонки",
+        **changes,
+    )
 
 
 class TestValidation(unittest.TestCase):
